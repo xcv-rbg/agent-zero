@@ -1,56 +1,65 @@
-### think
-convene a War Room expert panel before acting on complex tasks.
-fires 3 experts in parallel per round then a synthesizer produces the CONSENSUS PLAN.
-each round: experts read the shared blackboard and cross-pollinate. final synthesis resolves disagreements.
-args: `problem`, optional `rounds`, `preset`, `budget`
-- `problem`: complete problem statement with all relevant context, code, error messages, constraints. include everything the experts need — they have NO other context
-- `rounds`: `"1"` to `"4"`. default `"2"`. use `"3"` or `"4"` for deeply complex or multi-domain problems
-- `preset`: `"general"` (strategist/challenger/executor + synthesizer) or `"security"` (red/blue/architect + auditor)
-- `budget`: time budget in seconds, default `"90"`, max `"180"`
+# think
 
-**ALWAYS call think FIRST when:**
-- security analysis, vulnerability hunting, code audits, penetration testing
-- multi-step coding tasks, architecture decisions, major refactors
-- debugging hard, ambiguous, or recurring errors
-- the best approach is unclear or multiple valid strategies exist
-- significant failure risk, irreversible consequences, or production impact
-- research-heavy tasks requiring deep domain knowledge
-- you are stuck, looping, or your previous approach failed
-- you suspect you might be hallucinating or making assumptions
-- the task spans multiple tools, files, or systems
-- you need to plan a complex investigation or analysis workflow
+Convene an instant **War Room v3** — 3 specialists chat in parallel (WhatsApp-group style), then a synthesizer produces the **PLAN** you execute step by step. Entire run targets under 60 seconds.
 
-**call think AGAIN (mid-task) when:**
-- you hit an unexpected blocker or dead end
-- new information contradicts your current approach
-- the task turned out more complex than initially estimated
-- you've made 2+ attempts at something without success
-- you need to pivot strategy after partial execution
+## args
+| arg | required | values | default |
+|-----|----------|--------|---------|
+| `problem` | **yes** | Full problem + context + all code / errors / constraints | — |
+| `preset` | no | `general` · `security` | `general` |
+| `rounds` | no | 1–3 | 2 |
+| `budget` | no | seconds | 60 |
 
-**do NOT use for:**
-- simple factual lookups, single-command tasks, trivial file reads
-- when user explicitly says "quick", "just do it", or "skip thinking"
-- tasks you've already solved successfully with the same approach before
+> Include **everything** the experts need — they have **no other context**.
 
-**the output is your EXECUTION PLAN — follow it:**
-after the tool returns, the CONSENSUS PLAN is your step-by-step blueprint.
-execute each numbered step using your normal tools.
-if you discover new information during execution, adapt individual steps but maintain the overall strategy.
-if a step fails, consider calling think again with the new context.
+---
 
-example:
-~~~json
+## ALWAYS call think FIRST for:
+
+- **ANY security / hacking / CTF / pentest / recon / OSINT task** — no exceptions, every single time
+- **ANY non-trivial task the user brings** (more than one step or one command)
+- Multi-step coding, architecture decisions, major refactors, code audits
+- Debugging hard, ambiguous, or recurring errors
+- When the best approach is unclear or multiple valid strategies exist
+- Significant failure risk, irreversible actions, or production impact
+- Research-heavy tasks requiring deep domain knowledge
+- Tasks spanning multiple tools, files, or systems
+- Any task where failing would be expensive in time or effort
+
+## call think AGAIN mid-task when:
+
+- You hit an unexpected blocker or dead end
+- New information contradicts your current approach
+- The task turned out more complex than initially estimated
+- You have made 2+ attempts at something without success
+- You need to pivot strategy after partial execution
+- You are stuck or looping on the same approach
+
+## do NOT call think for:
+
+- Simple single-command tasks or trivial file reads
+- Obvious factual lookups with a single-step answer
+- When user explicitly says: "quick", "just do it", "skip thinking"
+- Tasks you have already solved with the same approach in this session
+
+---
+
+## example (security)
+
+```json
 {
-  "thoughts": [
-    "This is a complex security-critical task spanning multiple systems.",
-    "I should run the War Room to get expert consensus before acting."
-  ],
-  "headline": "Convening War Room expert panel",
+  "thoughts": "New security task — War Room first, always.",
   "tool_name": "think",
   "tool_args": {
-    "problem": "Find all security vulnerabilities in this Flask login endpoint and produce a prioritised fix plan.\n\nCode:\ndef login():\n    user = request.form['user']\n    pwd = request.form['pwd']\n    row = db.execute(f'SELECT * FROM users WHERE user={user} AND pwd={pwd}')\n    if row: session['user'] = user",
-    "rounds": "2",
-    "preset": "security"
+    "problem": "Target: wss://example.io/ws. Accepts WS handshakes from arbitrary origins, returns HTTP 101 with authenticated session cookies. Goal: confirm CSWSH exploitability and enumerate all WS methods. JS bundle excerpt attached.",
+    "preset": "security",
+    "rounds": 2
   }
 }
-~~~
+```
+
+---
+
+After `think` returns, the **PLAN / CALL** is your step-by-step blueprint.
+Execute each numbered step with your normal tools.
+If a step fails or you hit a blocker → call `think` again with updated context.
