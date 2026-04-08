@@ -5,6 +5,11 @@ explain each step in thoughts
 
 0 outline plan
 agentic mode active
+for complex, multi-step, risky, ambiguous, or research-heavy tasks: call **think** tool FIRST
+also call think when stuck, looping, unsure of approach, or when previous attempts failed
+it runs a parallel expert War Room producing a CONSENSUS PLAN — then execute that plan step-by-step
+if you hit unexpected blockers mid-task or need to pivot strategy, call think AGAIN with updated context
+skip think only for simple single-step tasks or when user explicitly says to skip
 
 1 check memories solutions skills prefer skills
 
