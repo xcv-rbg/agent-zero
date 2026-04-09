@@ -1,7 +1,7 @@
 from copy import deepcopy
 
 from helpers.api import ApiHandler, Request, Response
-from helpers import plugins, defer, dotenv
+from helpers import plugins, defer, dotenv, files
 from helpers.extension import call_extensions_async
 
 API_KEY_PLACEHOLDER = "************"
@@ -17,7 +17,7 @@ class ModelConfigSet(ApiHandler):
             return Response(status=400, response="Missing or invalid config")
 
         config_to_save = deepcopy(config)
-        for section_name in ("chat_model", "utility_model", "embedding_model"):
+        for section_name in ("chat_model", "utility_model", "war_model", "embedding_model"):
             section = config_to_save.get(section_name, {})
             if not isinstance(section, dict):
                 continue
@@ -46,6 +46,16 @@ class ModelConfigSet(ApiHandler):
             settings=config_to_save,
         )
 
+        saved_path = plugins.determine_plugin_asset_path(
+            "_model_config", project_name, agent_profile, plugins.CONFIG_FILE_NAME
+        )
+        if not saved_path or not files.exists(saved_path):
+            return {
+                "ok": False,
+                "error": "Configuration file was not written",
+                "saved_path": saved_path,
+            }
+
         # Check if embedding model changed and notify
         prev_embed = prev_config.get("embedding_model", {})
         new_embed = config_to_save.get("embedding_model", {})
@@ -58,4 +68,4 @@ class ModelConfigSet(ApiHandler):
                 call_extensions_async, "embedding_model_changed"
             )
 
-        return {"ok": True}
+        return {"ok": True, "saved_path": saved_path}

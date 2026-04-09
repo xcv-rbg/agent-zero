@@ -67,14 +67,22 @@ class Plugins(ApiHandler):
             agent_profile=agent_profile,
             only_first=True,
         )
+
+        # Always resolve via plugin helper so hooks/default-merging are applied
+        # consistently, even when a scoped config file already exists.
+        settings = plugins.get_plugin_config(
+            plugin_name,
+            agent=None,
+            project_name=project_name or None,
+            agent_profile=agent_profile or None,
+        ) or {}
+
         if result:
             entry = result[0]
             path = entry.get("path", "")
-            settings = files.read_file_json(path) if path else {}
             loaded_project_name = entry.get("project_name", "")
             loaded_agent_profile = entry.get("agent_profile", "")
         else:
-            settings = plugins.get_plugin_config(plugin_name, agent=None) or {}
             default_path = files.get_abs_path(
                 plugins.find_plugin_dir(plugin_name), plugins.CONFIG_DEFAULT_FILE_NAME
             )
@@ -233,7 +241,18 @@ class Plugins(ApiHandler):
         if not isinstance(settings, dict):
             return Response(status=400, response="settings must be an object")
         plugins.save_plugin_config(plugin_name, project_name, agent_profile, settings)
-        return {"ok": True}
+
+        saved_path = plugins.determine_plugin_asset_path(
+            plugin_name, project_name, agent_profile, plugins.CONFIG_FILE_NAME
+        )
+        if not saved_path or not files.exists(saved_path):
+            return {
+                "ok": False,
+                "error": "Configuration file was not written",
+                "saved_path": saved_path,
+            }
+
+        return {"ok": True, "saved_path": saved_path}
 
     @extension.extensible
     def _toggle_plugin(self, input: dict) -> dict | Response:

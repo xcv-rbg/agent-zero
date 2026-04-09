@@ -7,8 +7,36 @@ import { switcherState, switcherMethods } from "/plugins/_model_config/webui/swi
 export const MODEL_SECTIONS = [
   { key: 'chat_model', title: 'Main Model', desc: 'Primary model for chat, reasoning, and browser tasks.' },
   { key: 'utility_model', title: 'Utility Model', desc: 'Lightweight model for background tasks: memory management, prompt preparation, summarization.' },
+  {
+    key: 'war_model',
+    title: 'War Room Model',
+    desc: 'Model used by the War Room multi-agent thinking tool for all expert and synthesis calls. Leave provider blank to inherit the Main Model automatically.',
+    optional: true,
+  },
   { key: 'embedding_model', title: 'Embedding Model', desc: 'Model for generating vector embeddings used in knowledge retrieval.' }
 ];
+
+const MODEL_SECTION_DEFAULTS = {
+  chat_model: {
+    provider: '', name: '', api_key: '', api_base: '',
+    ctx_length: 0, ctx_history: 0.7, vision: false, max_embeds: 10,
+    rl_requests: 0, rl_input: 0, rl_output: 0, kwargs: {}
+  },
+  utility_model: {
+    provider: '', name: '', api_key: '', api_base: '',
+    ctx_length: 0, ctx_input: 0.7,
+    rl_requests: 0, rl_input: 0, rl_output: 0, kwargs: {}
+  },
+  war_model: {
+    provider: '', name: '', api_key: '', api_base: '',
+    ctx_length: 0, ctx_history: 0.7, vision: false,
+    rl_requests: 0, rl_input: 0, rl_output: 0, kwargs: {}
+  },
+  embedding_model: {
+    provider: '', name: '', api_key: '', api_base: '',
+    rl_requests: 0, rl_input: 0, kwargs: {}
+  },
+};
 
 export function kwargsToText(obj) {
   if (!obj || typeof obj !== 'object') return '';
@@ -65,6 +93,7 @@ export const store = createStore("modelConfig", {
   // Model summary state
   modelsSummary: [],
   modelsSummaryLoading: false,
+  modelsSummaryScopeLabel: 'Editing scope: Global',
   _modelsSummaryLoaded: false,
   _modelsSummaryPromise: null,
 
@@ -120,19 +149,53 @@ export const store = createStore("modelConfig", {
     this._loaded = true;
   },
 
-  async _fetchConfigData() {
+  async _fetchConfigData(projectName = '', agentProfile = '') {
+    const body = {};
+    if (projectName) body.project_name = projectName;
+    if (agentProfile) body.agent_profile = agentProfile;
     const res = await fetchApi(`${API_BASE}/model_config_get`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({})
+      body: JSON.stringify(body)
     });
     return await res.json();
   },
 
+  _ensureModelSections(config) {
+    if (!config || typeof config !== 'object') return;
+
+    for (const [key, defaults] of Object.entries(MODEL_SECTION_DEFAULTS)) {
+      const current = config[key];
+      if (!current || typeof current !== 'object') {
+        config[key] = { ...defaults };
+        continue;
+      }
+      if (!current.kwargs || typeof current.kwargs !== 'object') {
+        current.kwargs = {};
+      }
+    }
+  },
+
+  _syncKwargsFromText(config) {
+    if (!config || typeof config !== 'object') return;
+
+    for (const section of MODEL_SECTIONS) {
+      const model = config[section.key];
+      if (!model || typeof model !== 'object') continue;
+      if (typeof model._kwargs_text === 'string') {
+        model.kwargs = this.textToKwargs(model._kwargs_text);
+      } else if (!model.kwargs || typeof model.kwargs !== 'object') {
+        model.kwargs = {};
+      }
+    }
+  },
+
   // Config field initialization (converts kwargs dicts to editable text)
   initConfigFields(config) {
+    this._ensureModelSections(config);
     if (config?.chat_model) config.chat_model._kwargs_text = kwargsToText(config.chat_model.kwargs);
     if (config?.utility_model) config.utility_model._kwargs_text = kwargsToText(config.utility_model.kwargs);
+    if (config?.war_model) config.war_model._kwargs_text = kwargsToText(config.war_model.kwargs);
     if (config?.embedding_model) config.embedding_model._kwargs_text = kwargsToText(config.embedding_model.kwargs);
   },
 
@@ -204,16 +267,40 @@ export const store = createStore("modelConfig", {
   installSettingsHooks(context, config) {
     if (!context || context.__modelConfigHooksInstalled) return;
 
-    const originalSave = context.save.bind(context);
     context.save = async () => {
       context.error = null;
+      const currentConfig = context.settings || config || {};
+      this._ensureModelSections(currentConfig);
+      this._syncKwargsFromText(currentConfig);
+
       try {
-        await this.persistApiKeysForConfig(config);
+        await this.persistApiKeysForConfig(currentConfig);
       } catch (e) {
         context.error = e?.message || 'Failed to save API keys.';
         return;
       }
-      await originalSave();
+
+      try {
+        const response = await fetchApi(`${API_BASE}/model_config_set`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_name: context.projectName || '',
+            agent_profile: context.agentProfileKey || '',
+            config: currentConfig,
+          }),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!result?.ok) {
+          context.error = result?.error || 'Save failed';
+          return;
+        }
+
+        context.settingsSnapshotJson = context._toComparableJson(context.settings);
+        window.closeModal?.();
+      } catch (e) {
+        context.error = e?.message || 'Save failed';
+      }
     };
 
     const originalReset = context.resetToDefault.bind(context);
@@ -265,18 +352,51 @@ export const store = createStore("modelConfig", {
     return { matched, rest };
   },
 
+  _getActiveChatProjectName() {
+    return (globalThis.Alpine?.store('chats')?.selectedContext?.project?.name || '').trim();
+  },
+
+  _getActiveAgentProfileKey() {
+    return (globalThis.Alpine?.store('settings')?.settings?.agent_profile || '').trim();
+  },
+
   // Model summary for agent-settings page
   async loadModelsSummary() {
-    const data = await this._fetchConfigData();
+    const projectName = this._getActiveChatProjectName();
+    const agentProfile = this._getActiveAgentProfileKey();
+
+    const scopeParts = [];
+    if (projectName) scopeParts.push(`Project ${projectName}`);
+    if (agentProfile) scopeParts.push(`Agent ${agentProfile}`);
+    this.modelsSummaryScopeLabel = scopeParts.length
+      ? `Editing scope: ${scopeParts.join(' | ')}`
+      : 'Editing scope: Global';
+
+    const data = await this._fetchConfigData(projectName, agentProfile);
     const cfg = data.config || {};
     const chatP = data.chat_providers || [];
     const embedP = data.embedding_providers || [];
     const label = (list, id) => (list.find(x => x.value === id) || {}).label || id || '\u2014';
+    const warCfg = cfg.war_model;
+    const warConfigured = !!(warCfg?.provider || warCfg?.name);
+    const warInherited = !warConfigured;
     return [
       { icon: 'chat', title: 'Main', cfg: cfg.chat_model, pList: chatP },
       { icon: 'manufacturing', title: 'Utility', cfg: cfg.utility_model, pList: chatP },
+      {
+        icon: 'psychology',
+        title: 'War Room',
+        cfg: warInherited ? cfg.chat_model : warCfg,
+        pList: chatP,
+        inherited: warInherited,
+      },
       { icon: 'database', title: 'Embedding', cfg: cfg.embedding_model, pList: embedP },
-    ].map(s => ({ icon: s.icon, title: s.title, provider: label(s.pList, s.cfg?.provider), name: s.cfg?.name || '\u2014' }));
+    ].map(s => ({
+      icon: s.icon,
+      title: s.title,
+      provider: label(s.pList, s.cfg?.provider),
+      name: (s.cfg?.name || '\u2014') + (s.inherited ? ' (inherits Main)' : ''),
+    }));
   },
 
   async refreshModelsSummary() {
@@ -312,7 +432,9 @@ export const store = createStore("modelConfig", {
 
   async openConfigFromSummary() {
     try {
-      await pluginSettingsStore.openConfig('_model_config');
+      const projectName = this._getActiveChatProjectName();
+      const agentProfile = this._getActiveAgentProfileKey();
+      await pluginSettingsStore.openConfig('_model_config', projectName, agentProfile);
     } finally {
       await this.refreshModelsSummary();
     }

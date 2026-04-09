@@ -24,6 +24,20 @@ utility_model:
   rl_output: 0
   kwargs: {}
 
+# War Room model — used by the War Room multi-agent thinking tool.
+# Leave provider/name blank to inherit the main model automatically.
+war_model:
+  provider: ""
+  name: ""
+  api_base: ""
+  ctx_length: 0
+  ctx_history: 0.7
+  vision: false
+  rl_requests: 0
+  rl_input: 0
+  rl_output: 0
+  kwargs: {}
+
 embedding_model:
   provider: "huggingface"
   name: "sentence-transformers/all-MiniLM-L6-v2"

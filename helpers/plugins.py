@@ -752,13 +752,15 @@ def find_plugin_assets(
             )
             if _collect(path, project_name, agent_profile):
                 return results
-        if not agent_profile or agent_profile == "*":
-            # project/.a0proj/plugins/<plugin_name>/...
-            path = projects.get_project_meta(
-                project_name, files.PLUGINS_DIR, plugin_name, *subpaths
-            )
-            if _collect(path, project_name, ""):
-                return results
+
+        # Always include project-level fallback.
+        # This allows profile-specific lookups to inherit project plugin settings
+        # when no project+profile override exists.
+        path = projects.get_project_meta(
+            project_name, files.PLUGINS_DIR, plugin_name, *subpaths
+        )
+        if _collect(path, project_name, ""):
+            return results
 
     # usr/agents/<profile>/plugins/<plugin_name>/...
     if agent_profile:

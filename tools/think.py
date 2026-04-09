@@ -1,480 +1,891 @@
+# tools/think.py
+# ─────────────────────────────────────────────────────────────────────────────
+#  Agent Zero — War Room Multi-Agent Thinking Tool  v2.0
+#  Merged: SWARM Expert Panel + Blackboard Architecture + Parallel Micro-Rounds
+#
+#  INSTALL: drop this file at tools/think.py in your Agent Zero repo.
+#  No changes to agent.py are required.
+#
+#  Features:
+#    • Complexity Router: classifies every task before spinning agents
+#    • Parallel micro-rounds: all panelists fire simultaneously via asyncio.gather
+#    • Shared blackboard: every agent reads all prior round outputs
+#    • Divergence detection: Jaccard similarity on suggested_action fields
+#    • Flash Debate: only dissenters fire if consensus not reached after round 2
+#    • Synthesizer: ALWAYS called last, produces strict JSON tool request
+#    • War Room Model: uses build_war_model() from the _model_config plugin — configure via WebUI Models settings
+#    • Tool-request hardening: Synthesizer output = valid Agent Zero JSON
+#    • Environment diagnostics: detects missing tools/permissions and adds
+#      repair steps to the consensus plan
+# ─────────────────────────────────────────────────────────────────────────────
+
+from __future__ import annotations
+
 import asyncio
+import json
+import re
 import time
+from typing import Any, Optional
 
 from helpers.tool import Tool, Response
 from helpers.print_style import PrintStyle
 from langchain_core.messages import SystemMessage, HumanMessage
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  COMPLEXITY ROUTER — 1 fast LLM call, structured JSON output
+# ─────────────────────────────────────────────────────────────────────────────
+_ROUTER_SYSTEM = """You are a task complexity classifier for an AI agent system.
+Output ONLY a JSON object — no prose, no markdown fences.
 
-DEFAULT_BUDGET_SEC = 90
-MAX_BUDGET_SEC = 180
+Schema:
+{
+  "complexity": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "TRIVIAL",
+  "agent_count": 6 | 5 | 4 | 3 | 2 | 1,
+  "rounds": 3 | 2 | 1,
+  "mode": "planning" | "analysis" | "execution"
+}
 
-# ── Expert Definitions ────────────────────────────────────────────────────────
-# Compact system prompts (~80 words) for token efficiency.
-# Round-specific instructions are injected dynamically per-call.
+Rules:
+CRITICAL / 6 agents / 3 rounds — initial brief for a major operation, novel multi-stage attack,
+  architecture-level design, high-stakes security-critical decisions, ambiguous zero-day situations,
+  cross-system threat modeling, situations where a wrong decision has irreversible consequences.
+HIGH / 4-5 agents / 2-3 rounds — security work, complex planning, ambiguous goals,
+  multi-step research, first encounter with a problem, risky or irreversible actions,
+  error analysis where the cause is unclear.
+MEDIUM / 3 agents / 2 rounds — result analysis, moderate complexity, debugging known errors,
+  interpreting tool output where context is partially understood.
+LOW / 2 agents / 1 round — simple follow-up in an established plan, quick analysis of
+  a clear tool result, single-step action with limited unknowns.
+TRIVIAL / 1 agent / 1 round — lookup, echo, file listing, simple grep, well-understood next step
+  where the correct tool call is obvious.
 
-_GENERAL_EXPERTS = {
-    "STRATEGIST": {
-        "role": "Strategic Analyst",
+agent_count is determined by complexity:
+  CRITICAL → 6
+  HIGH → 4 or 5 (5 if involves adversarial/red-team context)
+  MEDIUM → 3
+  LOW → 2
+  TRIVIAL → 1
+
+mode=planning   : deciding what to do, initial task setup
+mode=analysis   : interpreting results / diagnosing errors / evaluating findings
+mode=execution  : plan exists, need precise tool parameters
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FIVE PANELIST PERSONAS — router picks subset based on agent_count
+#  agent_count 1 → [EXECUTOR]
+#  agent_count 3 → [STRATEGIST, EXECUTOR, CRITIC]
+#  agent_count 4 → [STRATEGIST, CHALLENGER, EXECUTOR, RESEARCHER]
+#  agent_count 5 → all five (used when escalation adds CRITIC mid-session)
+# ─────────────────────────────────────────────────────────────────────────────
+_ALL_PANELISTS: list[dict[str, str]] = [
+    {
+        "name": "STRATEGIST",
+        "role": "Strategic Planner",
         "icon": "icon://psychology",
         "color": "#aed6f1",
         "system": (
-            "You are STRATEGIST on an expert thinking panel. "
-            "Focus on: core challenge identification, hidden constraints, "
-            "dependencies, and the optimal high-level approach. "
-            "Think 3 steps ahead. Be decisive — no vague language. "
-            "State your single most important insight first."
+            "You are STRATEGIST on a war room panel. "
+            "Focus: goal decomposition, attack-surface mapping, risk/reward, prioritisation. "
+            "Think 3 steps ahead. Be decisive. Name concrete first actions.\n\n"
+            "Respond ONLY with this JSON (no prose):\n"
+            '{"position":"1-sentence position","suggested_action":"specific next action",'
+            '"key_risk":"top risk","confidence":0.8}'
         ),
     },
-    "CHALLENGER": {
+    {
+        "name": "CHALLENGER",
         "role": "Devil's Advocate",
         "icon": "icon://gavel",
         "color": "#f1948a",
         "system": (
-            "You are CHALLENGER on an expert thinking panel. "
-            "Find flaws in every proposal, identify blind spots, "
-            "stress-test assumptions, uncover hidden risks. "
-            "If everyone agrees, find what they are missing. "
-            "Always pair criticism with a concrete fix or alternative."
+            "You are CHALLENGER on a war room panel. "
+            "Focus: find flaws in every plan, stress-test assumptions, blind spots. "
+            "Always propose a concrete fix for every flaw. Reference specific panelist claims.\n\n"
+            "Respond ONLY with this JSON (no prose):\n"
+            '{"position":"1-sentence challenge","suggested_action":"alternative action",'
+            '"key_risk":"what group is missing","confidence":0.8}'
         ),
     },
-    "EXECUTOR": {
+    {
+        "name": "EXECUTOR",
         "role": "Implementer",
         "icon": "icon://build",
         "color": "#a9dfbf",
         "system": (
-            "You are EXECUTOR on an expert thinking panel. "
-            "Focus on: exact commands, tool parameters, file paths, "
-            "concrete step-by-step actions, error handling. "
-            "No hand-waving — if you cannot specify the exact action, say so."
+            "You are EXECUTOR on a war room panel. "
+            "Focus: exact commands, tool names, file paths, parameters. No hand-waving. "
+            "If you cannot specify the exact action, say so.\n"
+            "Available tools: code_execution, browser_open, browser_do, search_engine, "
+            "document_query, skills_tool, call_subordinate, memory_tool.\n\n"
+            "Respond ONLY with this JSON (no prose):\n"
+            '{"position":"implementation approach","suggested_action":"exact tool or command",'
+            '"key_risk":"top execution risk","confidence":0.8}'
         ),
     },
-    "SYNTH": {
-        "role": "Consensus Builder",
-        "icon": "icon://balance",
-        "color": "#f9e79f",
+    {
+        "name": "RESEARCHER",
+        "role": "Knowledge Specialist",
+        "icon": "icon://search",
+        "color": "#d7bde2",
         "system": (
-            "You are SYNTHESIZER on an expert thinking panel. "
-            "Identify agreements, resolve disagreements by weighing evidence, "
-            "produce clear actionable output. "
-            "Your output IS the group's final decision."
+            "You are RESEARCHER on a war room panel. "
+            "Focus: relevant CVEs, techniques, prior art, documentation, known patterns. "
+            "Always cite specific technique names, CVE IDs, or tool names.\n\n"
+            "Respond ONLY with this JSON (no prose):\n"
+            '{"position":"key knowledge for this task","suggested_action":"research-backed recommendation",'
+            '"key_risk":"known pitfall from prior art","confidence":0.8}'
         ),
     },
-}
-
-_SECURITY_EXPERTS = {
-    "RED": {
-        "role": "Offensive / Attacker",
-        "icon": "icon://bug_report",
-        "color": "#f1948a",
-        "system": (
-            "You are RED, offensive security expert on a security panel. "
-            "Think like an attacker. Identify every exploitable vulnerability, "
-            "attack vector, and trust boundary violation. "
-            "For each finding: name it, explain exploitation, rate severity."
-        ),
-    },
-    "BLUE": {
-        "role": "Defensive / Hardening",
-        "icon": "icon://security",
-        "color": "#aed6f1",
-        "system": (
-            "You are BLUE, defensive security expert on a security panel. "
-            "For each vulnerability: propose the specific code fix, config change, "
-            "or control. Identify detection gaps — missing logging or monitoring. "
-            "Prioritize by impact-to-effort ratio."
-        ),
-    },
-    "ARCHITECT": {
-        "role": "Threat Modeler",
-        "icon": "icon://account_tree",
-        "color": "#a9dfbf",
-        "system": (
-            "You are ARCHITECT, threat modeling expert on a security panel. "
-            "Identify systemic design flaws: privilege escalation, broken trust, "
-            "dangerous data flows, insecure defaults. Think STRIDE. "
-            "Propose architectural fixes, not patches."
-        ),
-    },
-    "AUDITOR": {
-        "role": "Code Reviewer / OWASP",
+    {
+        "name": "CRITIC",
+        "role": "Quality Reviewer",
         "icon": "icon://fact_check",
         "color": "#f9e79f",
         "system": (
-            "You are AUDITOR, code review and compliance expert on a security panel. "
-            "Map findings to OWASP Top 10 and CVE classes. "
-            "Check for: hardcoded secrets, insecure deps, unsafe deserialization, "
-            "missing validation, weak crypto."
+            "You are CRITIC on a war room panel. "
+            "Focus: edge cases, silent failures, false positives, completeness gaps. "
+            "If a plan can fail silently or miss something important, flag it.\n\n"
+            "Respond ONLY with this JSON (no prose):\n"
+            '{"position":"quality concern","suggested_action":"test or verification step",'
+            '"key_risk":"what could fail silently","confidence":0.8}'
         ),
     },
+    {
+        "name": "TACTICIAN",
+        "role": "Red Team Tactician",
+        "icon": "icon://military_tech",
+        "color": "#f8c471",
+        "system": (
+            "You are TACTICIAN on a war room panel. "
+            "Focus: adversarial thinking, bypass strategies, chaining vulnerabilities, "
+            "operational security, anti-detection, prioritizing highest-impact paths. "
+            "Always think from an attacker's perspective: what's the fastest path to impact?\n\n"
+            "Respond ONLY with this JSON (no prose):\n"
+            '{"position":"adversarial assessment","suggested_action":"highest-impact attack path",'
+            '"key_risk":"detection or mitigation risk","confidence":0.8}'
+        ),
+    },
+]
+
+_PANELIST_SUBSET: dict[int, list[str]] = {
+    1: ["EXECUTOR"],
+    2: ["STRATEGIST", "EXECUTOR"],
+    3: ["STRATEGIST", "EXECUTOR", "CRITIC"],
+    4: ["STRATEGIST", "CHALLENGER", "EXECUTOR", "RESEARCHER"],
+    5: ["STRATEGIST", "CHALLENGER", "EXECUTOR", "RESEARCHER", "CRITIC"],
+    6: ["STRATEGIST", "CHALLENGER", "EXECUTOR", "RESEARCHER", "CRITIC", "TACTICIAN"],
 }
 
-# ── Presets ────────────────────────────────────────────────────────────────────
-# Each preset defines which experts debate in parallel and who synthesizes.
-
-PRESETS = {
-    "general": {
-        "debaters": ["STRATEGIST", "CHALLENGER", "EXECUTOR"],
-        "synthesizer": "SYNTH",
-        "experts": _GENERAL_EXPERTS,
-        "default_rounds": 2,
-    },
-    "security": {
-        "debaters": ["RED", "BLUE", "ARCHITECT"],
-        "synthesizer": "AUDITOR",
-        "experts": _SECURITY_EXPERTS,
-        "default_rounds": 2,
-    },
+# ─────────────────────────────────────────────────────────────────────────────
+#  SYNTHESIZER — always called last, always produces the final decision
+# ─────────────────────────────────────────────────────────────────────────────
+_SYNTHESIZER: dict[str, str] = {
+    "name": "SYNTHESIZER",
+    "role": "Consensus Builder & Judge",
+    "icon": "icon://balance",
+    "color": "#f0e6c8",
+    "system": (
+        "You are SYNTHESIZER, the final judge on a war room panel.\n"
+        "Your output IS the group decision. The main AI agent executes it directly.\n\n"
+        "You MUST output ONLY this JSON object — no prose, no markdown fences:\n"
+        "{\n"
+        '  "consensus_action": "one sentence — what to do next",\n'
+        '  "confidence": 0.85,\n'
+        '  "key_risks": ["risk 1", "risk 2"],\n'
+        '  "dissent_notes": ["any unresolved minority concern"],\n'
+        '  "reasoning_trace": "brief: how consensus emerged from the debate",\n'
+        '  "for_agent_zero": {\n'
+        '    "thoughts": ["why this action was chosen based on the panel"],\n'
+        '    "headline": "short display headline",\n'
+        '    "tool_name": "code_execution",\n'
+        '    "tool_args": {"runtime": "python", "code": "# exact code here"}\n'
+        "  }\n"
+        "}\n\n"
+        "RULES FOR for_agent_zero:\n"
+        "- tool_name MUST be exactly one of: code_execution, browser_open, browser_do,\n"
+        "  search_engine, document_query, skills_tool, call_subordinate, memory_tool, response, think\n"
+        "- tool_args MUST match the chosen tool's expected argument schema exactly.\n"
+        "- For shell/terminal: {\"runtime\": \"terminal\", \"code\": \"bash command here\"}\n"
+        "- For Node.js: {\"runtime\": \"nodejs\", \"code\": \"// js code\"}\n"
+        "- For Python: {\"runtime\": \"python\", \"code\": \"# python code\"}\n"
+        "- For browser: browser_open → {\"url\": \"...\"}; browser_do → {\"action\": \"...\"}\n"
+        "- For search: {\"query\": \"search query\"}\n"
+        "- For skills: {\"action\": \"load\", \"skill\": \"skill_name\"}\n"
+        "- If multiple steps needed: tool_name=\"response\", tool_args={\"text\":\"Full numbered plan\"}\n"
+        "- thoughts MUST explain WHY based on the debate — not just restate the action.\n"
+        "- Output ONLY the JSON. No text before or after.\n\n"
+        "ENVIRONMENT REPAIR RULES:\n"
+        "If panelists identified a missing tool, permission error, or env issue:\n"
+        "  - Include a repair step FIRST in the plan (install package, chmod, use fallback)\n"
+        "  - Use code_execution with terminal runtime to install/fix before the main action\n"
+        "  - Common repairs:\n"
+        "    • 'command not found' → terminal: apt-get install / npm install / pip install\n"
+        "    • 'Module not found: ws' → terminal: cd /tmp && npm install ws\n"
+        "    • 'Permission denied' → terminal: chmod +x <file> OR sudo <cmd>\n"
+        "    • /bin/sh incompatibility → runtime='terminal', prefix cmd with 'bash -lc'\n"
+        "    • Python module missing → terminal: pip install <package>"
+    ),
 }
 
-# ── Round Instructions ────────────────────────────────────────────────────────
-# Injected per-round to enforce conciseness and cross-pollination.
-
-_PITCH_INSTRUCTION = (
-    "Give your initial analysis in 150-200 words MAX. "
-    "Be specific and actionable — name concrete tools, techniques, or steps. "
-    "End with: KEY RISK: <one sentence>."
-)
-
-_REACT_INSTRUCTION = (
-    "You have read everyone's positions on the blackboard. In 100-150 words:\n"
-    "1. React to ONE specific point from another expert (name them)\n"
-    "2. Refine OR defend your position with new reasoning\n"
-    "3. Flag any risk the group is still missing\n"
-    "End with: UPDATED POSITION: <one sentence>."
-)
-
-_SYNTHESIS_INSTRUCTION = (
-    "Read the ENTIRE blackboard. Produce the group's final consensus.\n"
-    "Resolve all disagreements by weighing the evidence presented.\n\n"
-    "You MUST use EXACTLY this format:\n\n"
-    "CONSENSUS PLAN:\n"
-    "1. [concrete action step]\n"
-    "2. [concrete action step]\n"
-    "(as many as needed)\n\n"
-    "KEY RISKS:\n"
-    "- [risk + mitigation]\n\n"
-    "DISSENT NOTES:\n"
-    "- [any unresolved minority opinions worth preserving]\n\n"
-    "FINAL RECOMMENDATION: [one sentence — the single most important first action]"
-)
+# ─────────────────────────────────────────────────────────────────────────────
+#  ENVIRONMENT DIAGNOSTICS PATTERNS
+#  These are checked against tool stderr/stdout to auto-suggest repair actions
+# ─────────────────────────────────────────────────────────────────────────────
+_ENV_PATTERNS: list[tuple[str, str]] = [
+    (r"command not found[:\s]+(\S+)",      "install missing command: {0}"),
+    (r"Cannot find module '([^']+)'",       "npm install {0}"),
+    (r"No module named '([^']+)'",          "pip install {0}"),
+    (r"ModuleNotFoundError.*'([^']+)'",     "pip install {0}"),
+    (r"Permission denied",                  "check permissions: chmod +x or run as root"),
+    (r"EACCES",                             "Node permission denied: check file paths or run chmod"),
+    (r"ENOENT.*'([^']+)'",                 "file not found: {0} — verify path exists"),
+    (r"bash: .*: not found",               "install package or check PATH"),
+    (r"/bin/sh.*syntax error",             "use runtime=terminal with bash -lc instead of sh"),
+]
 
 
-# ── Tool Class ────────────────────────────────────────────────────────────────
+def _diagnose_error(stderr: str, stdout: str) -> list[str]:
+    """
+    Scan stderr/stdout for known error patterns.
+    Returns list of human-readable repair suggestions.
+    """
+    text = (stderr or "") + "\n" + (stdout or "")
+    suggestions: list[str] = []
+    for pattern, template in _ENV_PATTERNS:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            try:
+                suggestion = template.format(*m.groups())
+            except IndexError:
+                suggestion = template
+            suggestions.append(suggestion)
+    return suggestions
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN TOOL CLASS
+# ─────────────────────────────────────────────────────────────────────────────
 class Think(Tool):
     """
-    War Room Multi-Agent Thinking Tool.
+    War Room Multi-Agent Thinking Tool for Agent Zero.
 
-    Architecture: Blackboard + Parallel Micro-Rounds + Synthesis.
-    Each debate round fires all experts simultaneously via asyncio.gather().
-    Experts read the shared blackboard and cross-pollinate between rounds.
-    A final synthesizer reads the full debate and produces the CONSENSUS PLAN.
+    Runs a smart panel of expert sub-LLM calls before the main agent
+    executes any tool on a complex task.
 
-    Tool args:
-        problem (str):  Full problem statement with all relevant context.
-        preset  (str):  "general" or "security". Default "general".
-        rounds  (str):  Number of debate rounds (1-4). Default from preset (2).
-        budget  (str):  Time budget in seconds. Default 90, max 180.
+    Args:
+        problem (str): Full problem statement with all context, code, errors.
+        error_context (str): Optional — stderr/stdout from a failed tool call.
+                             Triggers environment diagnostics mode.
+        mode (str): Optional override — "planning" | "analysis" | "execution".
+                    If omitted, the Complexity Router decides automatically.
     """
 
-    async def execute(self, **kwargs) -> Response:
-        # ── Resolve arguments ────────────────────────────────────────────
-        problem = (
-            kwargs.get("problem")
-            or self.args.get("problem", "")
-            or self.message
-        )
-        if not problem or not problem.strip():
-            return Response(
-                message="Error: 'problem' argument is required.",
-                break_loop=False,
-            )
+    # ── public entry point ────────────────────────────────────────────────────
+    async def execute(
+        self,
+        problem: str = "",
+        error_context: str = "",
+        mode: str = "",
+        **kwargs: Any,
+    ) -> Response:
 
-        preset_name = (
-            kwargs.get("preset") or self.args.get("preset", "general")
-        ).strip().lower()
-        if preset_name not in PRESETS:
-            preset_name = "general"
-        preset = PRESETS[preset_name]
+        # ── resolve args ──────────────────────────────────────────────────────
+        if not problem:
+            problem = self.args.get("problem", "") or self.message
+        error_context = error_context or self.args.get("error_context", "")
+        mode_override = mode or self.args.get("mode", "")
 
-        try:
-            req_rounds = int(
-                kwargs.get("rounds") or self.args.get("rounds", "0")
-            )
-        except (ValueError, TypeError):
-            req_rounds = 0
-        total_rounds = (
-            req_rounds if 1 <= req_rounds <= 4 else preset["default_rounds"]
-        )
+        p_head = PrintStyle(bold=True,  font_color="#c39bd3", padding=True)
+        p_body = PrintStyle(font_color="#d2b4de", padding=False)
+        p_div  = PrintStyle(font_color="#7f8c8d",  padding=False)
 
-        try:
-            budget_sec = max(
-                30,
-                min(
-                    int(
-                        kwargs.get("budget")
-                        or self.args.get("budget", str(DEFAULT_BUDGET_SEC))
-                    ),
-                    MAX_BUDGET_SEC,
-                ),
-            )
-        except (ValueError, TypeError):
-            budget_sec = DEFAULT_BUDGET_SEC
-
-        # ── Setup ────────────────────────────────────────────────────────
-        all_experts = preset["experts"]
-        debater_names = preset["debaters"]
-        synth_name = preset["synthesizer"]
-
-        h = PrintStyle(bold=True, font_color="#c39bd3", padding=True)
-        c = PrintStyle(font_color="#d2b4de", padding=False)
-        d = PrintStyle(font_color="#7f8c8d", padding=False)
-
-        roster = ", ".join(debater_names) + f" + {synth_name}"
-        h.print(
-            f"War Room | {total_rounds} round(s) + synthesis | "
-            f"preset: {preset_name} | budget: {budget_sec}s\n"
-            f"Experts: {roster}\n"
+        p_head.print(
+            f"🏛️  War Room activated\n"
             f"Problem: {problem[:160]}{'...' if len(problem) > 160 else ''}"
         )
 
-        blackboard: list[dict] = []
-        t0 = time.monotonic()
-        rounds_completed = 0
+        # Runtime diagnostics for war model usage visibility.
+        self._war_fallback_logged = False
+        self._war_fallback_count = 0
+        self._war_model_resolved = "unknown"
 
-        def elapsed() -> float:
-            return time.monotonic() - t0
+        start_time = time.time()
 
-        def remaining() -> float:
-            return max(0.0, budget_sec - elapsed())
+        # ── Step 0: Complexity Router ─────────────────────────────────────────
+        await self.set_progress("⚡ Complexity Router classifying task...")
+        route = await self._run_router(problem, mode_override)
+        agent_count: int = route.get("agent_count", 4)
+        max_rounds:  int = route.get("rounds", 2)
+        complexity:  str = route.get("complexity", "HIGH")
+        task_mode:   str = route.get("mode", "planning")
 
-        # ── Debate Rounds (parallel per round) ───────────────────────────
-        for rnd in range(1, total_rounds + 1):
-            if remaining() < 12:
-                h.print(
-                    f"Budget low ({elapsed():.0f}s) — jumping to synthesis."
-                )
+        # environment-error mode always uses analysis config
+        if error_context:
+            complexity  = "MEDIUM"
+            agent_count = 3
+            max_rounds  = 2
+            task_mode   = "analysis"
+            env_hints = _diagnose_error(error_context, "")
+        else:
+            env_hints = []
+
+        p_body.print(
+            f"📊 Complexity: {complexity} | "
+            f"Agents: {agent_count}/6 | "
+            f"Max rounds: {max_rounds} | "
+            f"Mode: {task_mode}"
+        )
+
+        # Show resolved War Room model at the start for traceability.
+        try:
+            from plugins._model_config.helpers.model_config import get_war_model_display
+
+            self._war_model_resolved = get_war_model_display(self.agent)
+            p_body.print(f"🧠 War model resolved: {self._war_model_resolved}")
+        except Exception:
+            pass
+
+        # select panelists
+        names = _PANELIST_SUBSET.get(agent_count, _PANELIST_SUBSET[4])
+        panelists = [p for p in _ALL_PANELISTS if p["name"] in names]
+
+        # ── Blackboard ────────────────────────────────────────────────────────
+        blackboard: list[dict] = []   # list of round dicts
+        consensus_score: float = 0.0
+
+        # ── Micro-Round Loop ──────────────────────────────────────────────────
+        for round_num in range(1, max_rounds + 1):
+
+            p_div.print(f"\n{'═'*55}\n  ROUND {round_num}/{max_rounds}\n{'═'*55}")
+
+            round_entries = await self._run_parallel_round(
+                panelists=panelists,
+                problem=problem,
+                blackboard=blackboard,
+                round_num=round_num,
+                env_hints=env_hints,
+                p_body=p_body,
+            )
+            blackboard.append({"round": round_num, "entries": round_entries})
+
+            # ── Divergence Detection ──────────────────────────────────────────
+            consensus_score = self._compute_consensus(round_entries)
+            p_body.print(
+                f"📐 Consensus score after round {round_num}: "
+                f"{consensus_score:.2f}"
+            )
+
+            if consensus_score >= 0.85 and round_num >= 2:
+                p_body.print("✅ Consensus reached — skipping remaining rounds")
                 break
 
-            d.print(
-                f"\n{'='*55}\n"
-                f"  ROUND {rnd}/{total_rounds}  "
-                f"({len(debater_names)} experts in parallel)\n"
-                f"{'='*55}"
+            if round_num < max_rounds and consensus_score < 0.50:
+                # escalate: add CRITIC if not already present
+                if not any(p["name"] == "CRITIC" for p in panelists):
+                    critic = next(p for p in _ALL_PANELISTS if p["name"] == "CRITIC")
+                    panelists.append(critic)
+                    p_body.print("⚠️  Low consensus — escalating: added CRITIC")
+
+        # ── Flash Debate (dissenters only, if MEDIUM+ complexity needed) ──────
+        if consensus_score < 0.60 and len(blackboard) >= 2 and agent_count >= 3:
+            p_div.print("\n⚡ Flash Debate — dissenters vs majority\n")
+            flash_entries = await self._run_flash_debate(
+                panelists=panelists,
+                problem=problem,
+                blackboard=blackboard,
+                consensus_score=consensus_score,
+                p_body=p_body,
             )
-            await self.set_progress(
-                f"Round {rnd}/{total_rounds} — "
-                f"{len(debater_names)} experts debating in parallel..."
-            )
+            if flash_entries:
+                blackboard.append({"round": "flash", "entries": flash_entries})
 
-            bb_text = _format_blackboard(blackboard)
-            first_round = rnd == 1
-            instruction = _PITCH_INSTRUCTION if first_round else _REACT_INSTRUCTION
+        # ── SYNTHESIZER — always called, no exceptions ─────────────────────────
+        await self.set_progress("🔬 SYNTHESIZER building final consensus...")
+        p_div.print(f"\n{'─'*55}\n  SYNTHESIZER (Final Judge)\n{'─'*55}")
 
-            # ── Parallel expert calls (streamed to WebUI) ────────────────
-            async def _call(name: str, _rnd: int = rnd) -> dict:
-                exp = all_experts[name]
-
-                # Create log entry BEFORE the call so streaming has a target
-                expert_log = self.agent.context.log.log(
-                    type="tool",
-                    heading=(
-                        f"{exp['icon']} War Room — "
-                        f"{name} ({exp['role']}) "
-                        f"| Round {_rnd}"
-                    ),
-                    content="",
-                    kvps={
-                        "expert": name,
-                        "role": exp["role"],
-                        "round": str(_rnd),
-                    },
-                )
-
-                if first_round:
-                    human = (
-                        f"TASK:\n{problem}\n\n"
-                        f"INSTRUCTION: {instruction}"
-                    )
-                else:
-                    human = (
-                        f"TASK:\n{problem}\n\n"
-                        f"=== BLACKBOARD ===\n{bb_text}\n\n"
-                        f"INSTRUCTION: {instruction}"
-                    )
-                msgs = [
-                    SystemMessage(content=exp["system"]),
-                    HumanMessage(content=human),
-                ]
-
-                # Stream callback: pushes tokens to WebUI in real time
-                async def _stream(chunk: str, _full: str) -> str | None:
-                    if chunk:
-                        expert_log.stream(content=chunk)
-                    return None
-
-                try:
-                    text, _ = await self.agent.call_chat_model(
-                        messages=msgs,
-                        background=True,
-                        response_callback=_stream,
-                    )
-                    text = text.strip()
-                except Exception as exc:
-                    text = (
-                        f"[ERROR: {name} — "
-                        f"{type(exc).__name__}: {exc}]"
-                    )
-                    expert_log.update(content=text)
-
-                # Update log with final kvps (elapsed time)
-                expert_log.update(kvps={"elapsed": f"{elapsed():.1f}s"})
-
-                h.print(
-                    f"[{name}]  {exp['role']}  | Round {_rnd}"
-                )
-                c.print(text)
-                d.print("-" * 50)
-
-                return {
-                    "round": _rnd,
-                    "expert": name,
-                    "role": exp["role"],
-                    "content": text,
-                }
-
-            raw_results = await asyncio.gather(
-                *(_call(n) for n in debater_names),
-                return_exceptions=True,
-            )
-
-            # Record to blackboard (skip exceptions — already logged in _call)
-            for entry in raw_results:
-                if isinstance(entry, dict):
-                    blackboard.append(entry)
-                elif isinstance(entry, BaseException):
-                    h.print(f"[ERROR] Expert failed: {entry}")
-
-            rounds_completed = rnd
-            await self.agent.handle_intervention("")
-            h.print(f"Round {rnd} done ({elapsed():.1f}s elapsed)")
-
-        # ── Synthesis ────────────────────────────────────────────────────
-        await self.set_progress(
-            f"Synthesis — {synth_name} building consensus..."
+        synthesis_raw = await self._run_synthesizer(
+            problem=problem,
+            blackboard=blackboard,
+            consensus_score=consensus_score,
+            env_hints=env_hints,
         )
-        d.print(f"\n{'='*55}\n  SYNTHESIS\n{'='*55}")
+        synthesis = self._safe_json(synthesis_raw)
 
-        synth_exp = all_experts[synth_name]
-        bb_text = _format_blackboard(blackboard)
-        synth_msgs = [
-            SystemMessage(content=synth_exp["system"]),
-            HumanMessage(
-                content=(
-                    f"TASK:\n{problem}\n\n"
-                    f"=== FULL BLACKBOARD ===\n{bb_text}\n\n"
-                    f"INSTRUCTION: {_SYNTHESIS_INSTRUCTION}"
-                )
-            ),
-        ]
+        elapsed = time.time() - start_time
 
-        # Create synthesis log entry for streaming
-        synth_log = self.agent.context.log.log(
-            type="tool",
-            heading=(
-                f"{synth_exp['icon']} War Room — "
-                f"{synth_name} ({synth_exp['role']}) | Synthesis"
-            ),
-            content="",
-            kvps={
-                "expert": synth_name,
-                "role": synth_exp["role"],
-                "phase": "synthesis",
-            },
+        # ── Format final response ─────────────────────────────────────────────
+        result = self._format_result(
+            blackboard=blackboard,
+            synthesis=synthesis,
+            synthesis_raw=synthesis_raw,
+            elapsed=elapsed,
+            panelists=panelists,
+            round_count=len([b for b in blackboard if b["round"] != "flash"]),
         )
 
-        async def _synth_stream(chunk: str, _full: str) -> str | None:
-            if chunk:
-                synth_log.stream(content=chunk)
-            return None
-
-        try:
-            synthesis, _ = await self.agent.call_chat_model(
-                messages=synth_msgs,
-                background=True,
-                response_callback=_synth_stream,
-            )
-            synthesis = synthesis.strip()
-        except Exception as exc:
-            synthesis = (
-                f"[SYNTHESIS ERROR: {type(exc).__name__}: {exc}]\n"
-                "Fallback: review the blackboard above and execute "
-                "the most agreed-upon approach."
-            )
-            synth_log.update(content=synthesis)
-
-        synth_log.update(kvps={"total_time": f"{elapsed():.1f}s"})
-        h.print(f"[{synth_name}]  {synth_exp['role']}  | Synthesis")
-        c.print(synthesis)
-
-        # ── Assemble response ────────────────────────────────────────────
-        # CRITICAL: Only the consensus plan goes into Response.message
-        # (which feeds into the LLM's context via hist_add_tool_result).
-        # The full debate transcript is already visible in WebUI logs
-        # via the per-expert log entries created above.
-        result = (
-            f"War Room ({preset_name} | {rounds_completed} rounds | "
-            f"{roster} | {elapsed():.1f}s)\n\n"
-            f"{synthesis}\n\n"
-            f"---\n"
-            f"INSTRUCTION: Execute the CONSENSUS PLAN above step-by-step. "
-            f"Use your tools to carry out each numbered action. "
-            f"If you discover new information during execution that "
-            f"contradicts the plan, adapt accordingly but follow the "
-            f"overall strategy."
-        )
-
-        h.print(f"War Room complete ({elapsed():.1f}s) — consensus ready.")
-
-        # Update the main tool log entry with completion summary
-        self.log.update(
-            heading=(
-                f"icon://psychology "
-                f"{self.agent.agent_name}: War Room Complete "
-                f"({preset_name} | {rounds_completed}R | {elapsed():.1f}s)"
-            ),
+        p_head.print(
+            f"🏛️  War Room complete — {elapsed:.1f}s | "
+            f"Confidence: {synthesis.get('confidence', '?')}"
         )
 
         return Response(message=result, break_loop=False)
 
-    def get_log_object(self):
+    # ─────────────────────────────────────────────────────────────────────────
+    #  INTERNAL HELPERS
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _llm_call(self, messages: list, temperature: float = 0.2) -> str:
+        """
+        Call the War Room dedicated model (or fall back to main chat model).
+        Uses build_war_model() from the _model_config plugin so that war model
+        settings saved via WebUI Configure Models → War Room are respected.
+        Falls back to the agent's main chat model on any exception.
+        """
+        war_display = "unknown"
+        war_explicit = False
+        try:
+            from plugins._model_config.helpers.model_config import (
+                build_war_model,
+                get_war_model_display,
+                get_config,
+            )
+
+            cfg = get_config(self.agent)
+            war_cfg = cfg.get("war_model", {}) if isinstance(cfg, dict) else {}
+            war_explicit = bool(
+                isinstance(war_cfg, dict)
+                and (war_cfg.get("provider") or war_cfg.get("name"))
+            )
+            war_display = get_war_model_display(self.agent)
+            self._war_model_resolved = war_display
+
+            llm = build_war_model(self.agent)
+            response, _reasoning = await llm.unified_call(
+                messages=messages,
+                temperature=temperature,
+            )
+            return (response or "").strip()
+        except Exception as exc:
+            # Log fallback reason once so model misconfiguration is visible.
+            self._war_fallback_count = int(getattr(self, "_war_fallback_count", 0)) + 1
+            if not getattr(self, "_war_fallback_logged", False):
+                self._war_fallback_logged = True
+                detail = (
+                    "War Room model call failed; falling back to Main model. "
+                    f"Resolved war model: {war_display}. Error: {exc}"
+                )
+                try:
+                    if self.agent and self.agent.context:
+                        self.agent.context.log.log(type="warning", content=detail)
+                except Exception:
+                    pass
+                if war_explicit:
+                    PrintStyle(font_color="orange", padding=True).print(detail)
+
+        try:
+            raw, _ = await self.agent.call_chat_model(
+                messages=messages,
+                background=True,
+            )
+            return (raw or "").strip()
+        except Exception as exc:
+            return f"[LLM call error: {exc}]"
+
+    async def _run_router(self, problem: str, mode_override: str) -> dict:
+        """Run the complexity router; returns route dict with fallback defaults."""
+        if mode_override in ("planning", "analysis", "execution"):
+            mapping = {
+                "planning":  {"complexity": "HIGH",   "agent_count": 5, "rounds": 3, "mode": "planning"},
+                "analysis":  {"complexity": "MEDIUM", "agent_count": 3, "rounds": 2, "mode": "analysis"},
+                "execution": {"complexity": "LOW",    "agent_count": 2, "rounds": 1, "mode": "execution"},
+            }
+            return mapping[mode_override]
+
+        msgs = [
+            SystemMessage(content=_ROUTER_SYSTEM),
+            HumanMessage(content=f"Task to classify:\n{problem}"),
+        ]
+        raw = await self._llm_call(msgs, temperature=0.0)
+        result = self._safe_json(raw)
+        # validate and set sane defaults
+        if result.get("agent_count") not in (1, 2, 3, 4, 5, 6):
+            result["agent_count"] = 4
+        if result.get("rounds") not in (1, 2, 3):
+            result["rounds"] = 2
+        if result.get("complexity") not in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "TRIVIAL"):
+            result["complexity"] = "HIGH"
+        return result
+
+    async def _run_one_panelist(
+        self,
+        panelist: dict,
+        problem: str,
+        blackboard: list[dict],
+        round_num: int,
+        env_hints: list[str],
+    ) -> dict:
+        """Single panelist call; returns entry dict for the blackboard."""
+        # Build blackboard snapshot for this panelist
+        board_text = self._render_blackboard(blackboard)
+        env_section = (
+            "\n\nENVIRONMENT ISSUES DETECTED (consider in your response):\n"
+            + "\n".join(f"- {h}" for h in env_hints)
+        ) if env_hints else ""
+
+        human_content = (
+            f"TASK:\n{problem}"
+            f"{env_section}"
+            + (
+                f"\n\nBLACKBOARD (all prior rounds):\n{board_text}"
+                if board_text else
+                "\n\n(You are first to speak — no prior discussion.)"
+            )
+            + (
+                f"\n\nThis is Round {round_num}. "
+                + ("Give your initial position." if round_num == 1
+                   else "React to at least ONE specific point from another panelist, then refine your position.")
+            )
+        )
+
+        msgs = [
+            SystemMessage(content=panelist["system"]),
+            HumanMessage(content=human_content),
+        ]
+        raw = await self._llm_call(msgs, temperature=0.25)
+        structured = self._safe_json(raw)
+
+        return {
+            "agent":      panelist["name"],
+            "role":       panelist["role"],
+            "round":      round_num,
+            "raw":        raw,
+            "structured": structured,
+        }
+
+    async def _run_parallel_round(
+        self,
+        panelists: list[dict],
+        problem: str,
+        blackboard: list[dict],
+        round_num: int,
+        env_hints: list[str],
+        p_body: PrintStyle,
+    ) -> list[dict]:
+        """Fire all panelists in parallel; stream each result to WebUI as it arrives."""
+        await self.set_progress(
+            f"🧠 Round {round_num} — {len(panelists)} panelists firing in parallel..."
+        )
+
+        # Tagged wrapper bundles panelist identity with its result so we can
+        # stream results to the WebUI in completion order (as_completed) without
+        # a dict lookup (which fails because as_completed wraps futures).
+        async def _tagged(p: dict) -> tuple[dict, dict]:
+            try:
+                entry = await self._run_one_panelist(
+                    p, problem, blackboard, round_num, env_hints
+                )
+            except Exception as exc:
+                entry = {
+                    "agent":      p["name"],
+                    "role":       p["role"],
+                    "round":      round_num,
+                    "raw":        f"[ERROR: {exc}]",
+                    "structured": {
+                        "position": "error",
+                        "suggested_action": "error",
+                        "key_risk": str(exc),
+                        "confidence": 0.0,
+                    },
+                }
+            return p, entry
+
+        tasks = [_tagged(p) for p in panelists]
+        results: list[dict] = []
+
+        # Stream each result to WebUI as it arrives (as_completed, not gather)
+        for coro in asyncio.as_completed(tasks):
+            panelist, entry = await coro
+
+            results.append(entry)
+
+            # ── Stream immediately to WebUI (not batch wait) ──────────────────
+            s = entry["structured"]
+            display = (
+                f"[{entry['agent']}] {entry['role']}\n"
+                f"  Position: {s.get('position', entry['raw'][:120])}\n"
+                f"  Action:   {s.get('suggested_action', '—')}\n"
+                f"  Risk:     {s.get('key_risk', '—')}\n"
+                f"  Conf:     {s.get('confidence', '?')}"
+            )
+            p_body.print(display)
+            self.agent.context.log.log(
+                type="tool",
+                heading=(
+                    f"{panelist.get('icon', '🧠')} War Room "
+                    f"[{entry['agent']}] Round {round_num}"
+                ),
+                content=display,
+                kvps={
+                    "agent": entry["agent"],
+                    "role":  entry["role"],
+                    "round": str(round_num),
+                    "suggested_action": s.get("suggested_action", ""),
+                    "confidence": str(s.get("confidence", "")),
+                },
+            )
+            # Yield control so the WebSocket loop can push the update
+            await asyncio.sleep(0)
+
+        return results
+
+    async def _run_flash_debate(
+        self,
+        panelists: list[dict],
+        problem: str,
+        blackboard: list[dict],
+        consensus_score: float,
+        p_body: PrintStyle,
+    ) -> list[dict]:
+        """Flash debate: identify 1-2 dissenters, fire them + 1 majority rep only."""
+        all_entries = [e for rd in blackboard for e in rd.get("entries", [])]
+        if not all_entries:
+            return []
+
+        # simple dissent detection: pick agents with lowest confidence
+        sorted_entries = sorted(
+            all_entries,
+            key=lambda e: float(e.get("structured", {}).get("confidence", 0.5)),
+        )
+        dissenters = sorted_entries[:min(2, len(sorted_entries))]
+        majority_entry = sorted_entries[-1] if len(sorted_entries) > 1 else sorted_entries[0]
+
+        board_text = self._render_blackboard(blackboard)
+        flash_entries: list[dict] = []
+        tasks = []
+
+        async def _flash_one(entry: dict, is_dissenter: bool) -> dict:
+            agent_name = entry["agent"]
+            panelist = next((p for p in panelists if p["name"] == agent_name), None)
+            if not panelist:
+                return {}
+            prompt_prefix = (
+                f"FLASH DEBATE — consensus_score={consensus_score:.2f}\n"
+                + (
+                    "You are a DISSENTER. In ≤40 words, state your final objection "
+                    "and the specific consequence of ignoring your concern."
+                    if is_dissenter else
+                    "You represent the MAJORITY position. In ≤40 words, explain "
+                    "why the group approach handles the dissent, or acknowledge it as a risk."
+                )
+            )
+            msgs = [
+                SystemMessage(content=panelist["system"]),
+                HumanMessage(
+                    content=f"{prompt_prefix}\n\nFULL BLACKBOARD:\n{board_text}\n\nTASK: {problem}"
+                ),
+            ]
+            raw = await self._llm_call(msgs, temperature=0.2)
+            return {
+                "agent":      agent_name,
+                "role":       panelist["role"],
+                "round":      "flash",
+                "raw":        raw,
+                "structured": {"position": raw, "suggested_action": raw, "key_risk": "", "confidence": 0.5},
+                "flash_role": "dissenter" if is_dissenter else "majority",
+            }
+
+        flash_tasks = [_flash_one(e, True)  for e in dissenters] + \
+                      [_flash_one(majority_entry, False)]
+
+        raw_results = await asyncio.gather(*flash_tasks, return_exceptions=True)
+        for r in raw_results:
+            if isinstance(r, dict) and r:
+                flash_entries.append(r)
+                role_label = r.get("flash_role", "")
+                p_body.print(f"  ⚡ [{r['agent']}] ({role_label}): {r['raw'][:160]}")
+
+        return flash_entries
+
+    async def _run_synthesizer(
+        self,
+        problem: str,
+        blackboard: list[dict],
+        consensus_score: float,
+        env_hints: list[str],
+    ) -> str:
+        """Always-called synthesizer; produces strict JSON decision object."""
+        board_text = self._render_blackboard(blackboard)
+        env_section = (
+            "\n\nENVIRONMENT ISSUES TO ADDRESS IN REPAIR STEP:\n"
+            + "\n".join(f"- {h}" for h in env_hints)
+        ) if env_hints else ""
+
+        human = (
+            f"ORIGINAL TASK:\n{problem}"
+            f"{env_section}"
+            f"\n\nCONSENSUS SCORE AFTER DEBATE: {consensus_score:.2f}"
+            f"\n\nFULL BLACKBOARD:\n{board_text}"
+            "\n\nProduce the final JSON consensus decision now."
+        )
+
+        msgs = [
+            SystemMessage(content=_SYNTHESIZER["system"]),
+            HumanMessage(content=human),
+        ]
+        raw = await self._llm_call(msgs, temperature=0.1)
+
+        # Log synthesizer output
+        self.agent.context.log.log(
+            type="tool",
+            heading=f"⚖️  War Room [SYNTHESIZER] — Final Consensus",
+            content=raw[:800],
+            kvps={"consensus_score": f"{consensus_score:.2f}"},
+        )
+        return raw
+
+    # ── utilities ─────────────────────────────────────────────────────────────
+
+    def _render_blackboard(self, blackboard: list[dict]) -> str:
+        """Render blackboard as readable text for prompt injection."""
+        lines: list[str] = []
+        for rd in blackboard:
+            r = rd["round"]
+            lines.append(f"\n--- Round {r} ---")
+            for entry in rd.get("entries", []):
+                s = entry.get("structured", {})
+                lines.append(
+                    f"[{entry['agent']}] "
+                    f"Position: {s.get('position', entry.get('raw','')[:100])} | "
+                    f"Action: {s.get('suggested_action','—')} | "
+                    f"Risk: {s.get('key_risk','—')} | "
+                    f"Conf: {s.get('confidence','?')}"
+                )
+        return "\n".join(lines).strip()
+
+    def _compute_consensus(self, entries: list[dict]) -> float:
+        """Jaccard similarity on suggested_action tokens. Returns 0-1."""
+        actions = [
+            e.get("structured", {}).get("suggested_action", e.get("raw", ""))
+            for e in entries
+        ]
+        if len(actions) < 2:
+            return 1.0
+
+        def tok(text: str) -> set[str]:
+            return set(re.findall(r"\b\w{3,}\b", text.lower()))
+
+        sets = [tok(a) for a in actions]
+        scores: list[float] = []
+        for i in range(len(sets)):
+            for j in range(i + 1, len(sets)):
+                a, b = sets[i], sets[j]
+                if not a and not b:
+                    scores.append(1.0)
+                elif not a or not b:
+                    scores.append(0.0)
+                else:
+                    scores.append(len(a & b) / len(a | b))
+        return sum(scores) / len(scores) if scores else 1.0
+
+    def _safe_json(self, raw: str) -> dict:
+        """Extract JSON from a string; returns {} on failure."""
+        if not raw:
+            return {}
+        try:
+            # strip markdown fences
+            cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
+            # find the first { ... } block
+            start = cleaned.find("{")
+            end   = cleaned.rfind("}")
+            if start >= 0 and end >= 0:
+                return json.loads(cleaned[start : end + 1])
+        except Exception:
+            pass
+        try:
+            from helpers.dirty_json import DirtyJson
+            return DirtyJson.parse_string(raw) or {}
+        except Exception:
+            pass
+        return {}
+
+    def _format_result(
+        self,
+        blackboard: list[dict],
+        synthesis: dict,
+        synthesis_raw: str,
+        elapsed: float,
+        panelists: list[dict],
+        round_count: int,
+    ) -> str:
+        """Build the final Response.message string."""
+        faz = synthesis.get("for_agent_zero", {})
+        lines = [
+            f"# 🏛️ War Room Complete — {elapsed:.1f}s | {round_count} round(s) | {len(panelists)} panelists",
+            "",
+            f"**Consensus:** {synthesis.get('consensus_action', 'See synthesis below')}",
+            f"**Confidence:** {synthesis.get('confidence', '?')}",
+            f"**War Model:** {getattr(self, '_war_model_resolved', 'unknown')}",
+        ]
+
+        fallback_count = int(getattr(self, "_war_fallback_count", 0))
+        if fallback_count > 0:
+            lines.append(f"**War Model Fallbacks To Main:** {fallback_count}")
+
+        risks = synthesis.get("key_risks", [])
+        if risks:
+            lines += ["", "**Key Risks:**"] + [f"- {r}" for r in risks]
+
+        dissent = synthesis.get("dissent_notes", [])
+        if dissent:
+            lines += ["", "**Dissent Notes:**"] + [f"- {d}" for d in dissent]
+
+        lines += [
+            "",
+            "---",
+            "## Debate Transcript",
+        ]
+        for rd in blackboard:
+            r = rd["round"]
+            lines.append(f"\n### Round {r}")
+            for e in rd.get("entries", []):
+                s = e.get("structured", {})
+                lines.append(
+                    f"**[{e['agent']}]** {s.get('position', e.get('raw','')[:120])}  "
+                    f"→ _{s.get('suggested_action','—')}_"
+                )
+
+        lines += [
+            "",
+            "---",
+            "## ✅ SYNTHESIZER FINAL DECISION",
+            "",
+            f"**Reasoning:** {synthesis.get('reasoning_trace', '—')}",
+            "",
+        ]
+
+        # Include the for_agent_zero block so the main agent can copy it
+        if faz:
+            lines += [
+                "## 🎯 FOR_AGENT_ZERO (execute this next):",
+                "```json",
+                json.dumps(faz, indent=2),
+                "```",
+                "",
+                "**Read the JSON block above. Use `tool_name` and `tool_args` as your next action.**",
+                "**Do NOT say 'I will do X' — emit the JSON tool call directly.**",
+            ]
+        else:
+            # fallback: include raw synthesis
+            lines += ["```", synthesis_raw[:1200], "```"]
+
+        return "\n".join(lines)
+
+    def get_log_object(self) -> Any:
         return self.agent.context.log.log(
             type="tool",
-            heading=(
-                f"icon://psychology "
-                f"{self.agent.agent_name}: War Room Thinking"
-            ),
+            heading=f"🏛️ {self.agent.agent_name} — War Room Thinking",
             content="",
             kvps=self.args,
-            _tool_name=self.name,
+            tool_name=self.name,
         )
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _format_blackboard(board: list[dict]) -> str:
-    """Format the blackboard entries as readable text for prompt injection."""
-    if not board:
-        return "(empty)"
-    parts: list[str] = []
-    cur_round = 0
-    for e in board:
-        if e["round"] != cur_round:
-            cur_round = e["round"]
-            parts.append(f"\n--- Round {cur_round} ---\n")
-        parts.append(
-            f"[{e['expert']} — {e['role']}]\n{e['content']}\n"
-        )
-    return "\n".join(parts)

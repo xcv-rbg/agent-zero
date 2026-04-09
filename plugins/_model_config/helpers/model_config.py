@@ -114,10 +114,142 @@ def get_utility_model_config(agent=None) -> dict:
     return cfg.get("utility_model", {})
 
 
+def _get_agent_scope(agent=None) -> tuple[str, str]:
+    """Return (project_name, agent_profile) for current runtime agent."""
+    project_name = ""
+    agent_profile = ""
+
+    if not agent:
+        return project_name, agent_profile
+
+    try:
+        from helpers import projects
+
+        project_name = projects.get_context_project_name(agent.context) or ""
+    except Exception:
+        project_name = ""
+
+    try:
+        agent_profile = getattr(getattr(agent, "config", None), "profile", "") or ""
+    except Exception:
+        agent_profile = ""
+
+    return project_name, agent_profile
+
+
+def _find_explicit_war_scope_override(agent=None) -> tuple[dict, bool]:
+    """Find the first explicit war_model key in scope order.
+
+    Returns:
+      (war_dict, True)  if a scope explicitly defines war_model
+      ({}, False)       if no scope defines war_model key at all
+
+    Important: we inspect raw config files so we can distinguish between:
+    - key absent (inherit from broader scope)
+    - key present but blank (intentional inherit-main override at this scope)
+    """
+    project_name, agent_profile = _get_agent_scope(agent)
+    scoped_configs = plugins.find_plugin_assets(
+        plugins.CONFIG_FILE_NAME,
+        plugin_name="_model_config",
+        project_name=project_name,
+        agent_profile=agent_profile,
+        only_first=False,
+    )
+
+    for config_file in scoped_configs:
+        path = config_file.get("path", "")
+        if not path:
+            continue
+        try:
+            cfg = files.read_file_json(path) or {}
+        except Exception:
+            continue
+        if not isinstance(cfg, dict):
+            continue
+        if "war_model" not in cfg:
+            continue
+
+        war_cfg = cfg.get("war_model")
+        return (war_cfg if isinstance(war_cfg, dict) else {}), True
+
+    return {}, False
+
+
+def get_war_model_config(agent=None) -> dict:
+    """Get War Room model config.
+
+    Works identically to get_utility_model_config but falls back to the main
+    chat model when no dedicated War Room provider/name is configured.
+    """
+    explicit_war, has_explicit_war = _find_explicit_war_scope_override(agent)
+    if has_explicit_war:
+        war = explicit_war
+    else:
+        cfg = get_config(agent)
+        war = cfg.get("war_model", {})
+
+    if not isinstance(war, dict):
+        war = {}
+
+    main = get_chat_model_config(agent)
+
+    # If no dedicated War Room model is configured, inherit Main entirely.
+    if not (war.get("provider") or war.get("name")):
+        return main
+
+    # Dedicated War Room model: inherit missing connection fields from Main,
+    # so users can override model/provider without duplicating every setting.
+    merged = dict(main) if isinstance(main, dict) else {}
+    if isinstance(war, dict):
+        merged.update(war)
+
+    if not merged.get("provider"):
+        merged["provider"] = main.get("provider", "")
+    if not merged.get("name"):
+        merged["name"] = main.get("name", "")
+    if not merged.get("api_base") and main.get("api_base"):
+        merged["api_base"] = main.get("api_base", "")
+    if not merged.get("api_key") and main.get("api_key"):
+        merged["api_key"] = main.get("api_key", "")
+
+    main_kwargs = main.get("kwargs", {}) if isinstance(main, dict) else {}
+    merged_kwargs = merged.get("kwargs", {}) if isinstance(merged, dict) else {}
+    if isinstance(main_kwargs, dict):
+        if isinstance(merged_kwargs, dict):
+            kw = dict(main_kwargs)
+            kw.update(merged_kwargs)
+            merged["kwargs"] = kw
+        elif not merged_kwargs:
+            merged["kwargs"] = dict(main_kwargs)
+
+    return merged
+
+
 def get_embedding_model_config(agent=None) -> dict:
     """Get embedding model config."""
     cfg = get_config(agent)
     return cfg.get("embedding_model", {})
+
+
+def build_war_model(agent=None):
+    """Build and return a LiteLLMChatWrapper for War Room expert calls."""
+    cfg = get_war_model_config(agent)
+    mc = build_model_config(cfg, models.ModelType.CHAT)
+    return models.get_chat_model(
+        mc.provider, mc.name, model_config=mc, **mc.build_kwargs()
+    )
+
+
+def get_war_model_display(agent=None) -> str:
+    """Return a human-readable 'provider/name' string for the War Room model."""
+    war, has_explicit_war = _find_explicit_war_scope_override(agent)
+    if has_explicit_war and (war.get("provider") or war.get("name")):
+        resolved = get_war_model_config(agent)
+        return f"{resolved.get('provider', '')}/{resolved.get('name', '')}"
+    main = get_chat_model_config(agent)
+    return f"(inherits Main) {main.get('provider', '')}/{main.get('name', '')}"
+
 
 def is_chat_override_allowed(agent=None) -> bool:
     """Check if per-chat model override is enabled."""
@@ -231,6 +363,11 @@ def get_missing_api_key_providers(agent=None) -> list[dict]:
     checks = [
         ("Chat Model", cfg.get("chat_model", {})),
         ("Utility Model", cfg.get("utility_model", {})),
+        *(
+            [("War Room Model", cfg.get("war_model", {}))]
+            if cfg.get("war_model", {}).get("provider")
+            else []
+        ),
         ("Embedding Model", cfg.get("embedding_model", {})),
     ]
 

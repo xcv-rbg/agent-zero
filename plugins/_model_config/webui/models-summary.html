@@ -23,6 +23,7 @@
             <div class="field-title">Current Models</div>
             <div class="field-description">Active model configuration resolved from global, project, and agent profile
               scopes.</div>
+            <div class="model-summary-scope" x-text="$store.modelConfig.modelsSummaryScopeLabel"></div>
           </div>
           <div x-show="$store.modelConfig.modelsSummaryLoading" style="text-align:center; padding:12px;">
             <span class="material-symbols-outlined spinning" style="font-size:18px;">progress_activity</span>
@@ -67,6 +68,12 @@
 
     .model-summary-header {
       margin-bottom: 8px;
+    }
+
+    .model-summary-scope {
+      margin-top: 4px;
+      font-size: 0.78rem;
+      opacity: 0.72;
     }
 
     .model-summary-grid {
