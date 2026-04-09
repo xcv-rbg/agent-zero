@@ -1116,6 +1116,8 @@ export async function drawMessageTool({
 
   if (!tool_name) {
     return drawMessageToolSimple({ ...arguments[0] });
+  } else if (kvps._tool_name === "think") {
+    return drawMessageWarRoom({ ...arguments[0] });
   } else if (kvps._tool_name === "skills_tool") {
     const displayKvps = { ...(kvps || {}) };
     delete displayKvps._tool_name;
@@ -1186,6 +1188,50 @@ export function drawMessageToolSimple({
     actionButtons,
     log: arguments[0],
   });
+}
+
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
+export function drawMessageWarRoom({
+  id,
+  heading,
+  content,
+  kvps,
+  ...additional
+}) {
+  const title = cleanStepTitle(heading || "War Room") || "War Room";
+  const contentText = String(content ?? "");
+  const actionButtons = contentText.trim()
+    ? [
+        createActionButton("detail", "", () =>
+          stepDetailStore.showStepDetail(buildDetailPayload(arguments[0])),
+        ),
+        createActionButton("speak", "", () => speechStore.speak(contentText)),
+        createActionButton("copy", "", () => copyToClipboard(contentText)),
+      ].filter(Boolean)
+    : [];
+
+  const result = drawProcessStep({
+    id,
+    title,
+    code: "UTL",
+    classes: ["message-war-room"],
+    kvps: null,
+    content,
+    contentClasses: ["war-room-detail-content"],
+    actionButtons,
+    log: arguments[0],
+    allowCompletedGroup: true,
+  });
+
+  if (result?.step) {
+    cancelStepCollapse(result.step);
+    toggleStepCollapse(result.step, true);
+  }
+
+  return result;
 }
 
 /**

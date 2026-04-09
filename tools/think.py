@@ -310,6 +310,19 @@ class Think(Tool):
         self._war_fallback_count = 0
         self._war_model_resolved = "unknown"
 
+        # ── Cache war model once for the entire session ──────────────
+        self._cached_war_llm = None
+        try:
+            from plugins._model_config.helpers.model_config import (
+                build_war_model,
+                get_war_model_display,
+                get_config,
+            )
+            self._cached_war_llm = build_war_model(self.agent)
+            self._war_model_resolved = get_war_model_display(self.agent)
+        except Exception:
+            pass  # Will fall back to main model in _llm_call
+
         start_time = time.time()
 
         # ── Step 0: Complexity Router ─────────────────────────────────────────
@@ -350,6 +363,36 @@ class Think(Tool):
         names = _PANELIST_SUBSET.get(agent_count, _PANELIST_SUBSET[4])
         panelists = [p for p in _ALL_PANELISTS if p["name"] in names]
 
+        # ── Single consolidated log entry for the entire War Room session ─────
+        # Reuse the active tool log when available so live updates appear in the
+        # same UI tab the user already has open.
+        self._war_log = getattr(self, "log", None)
+        if not self._war_log:
+            # Extension or direct call — create a proper tool log so the WebUI
+            # routes it through drawMessageWarRoom (requires type="tool" +
+            # _tool_name="think" in kvps).
+            import uuid
+            self._war_log = self.agent.context.log.log(
+                type="tool",
+                heading=f"🏛️ {self.agent.agent_name} — War Room Deliberating…",
+                content="Initializing War Room...",
+                kvps=self.args or {},
+                _tool_name="think",
+                id=str(uuid.uuid4()),
+            )
+        else:
+            self._war_log.update(
+                heading=f"🏛️ {self.agent.agent_name} — War Room Deliberating…",
+            )
+        self._war_live_sections = [
+            (
+                f"📊 {complexity} | {len(panelists)} panelists | "
+                f"{max_rounds} rounds | Model: {self._war_model_resolved}\n"
+            )
+        ]
+        self._war_live_preview = ""
+        self._refresh_war_log_content()
+
         # ── Blackboard ────────────────────────────────────────────────────────
         blackboard: list[dict] = []   # list of round dicts
         consensus_score: float = 0.0
@@ -358,6 +401,10 @@ class Think(Tool):
         for round_num in range(1, max_rounds + 1):
 
             p_div.print(f"\n{'═'*55}\n  ROUND {round_num}/{max_rounds}\n{'═'*55}")
+
+            self._append_war_section(
+                f"\n━━ Round {round_num} ━━━━━━━━━━━━━━━━━\n",
+            )
 
             round_entries = await self._run_parallel_round(
                 panelists=panelists,
@@ -375,9 +422,13 @@ class Think(Tool):
                 f"📐 Consensus score after round {round_num}: "
                 f"{consensus_score:.2f}"
             )
+            self._append_war_section(
+                f"\n📐 Consensus: {consensus_score:.2f}\n",
+            )
 
-            if consensus_score >= 0.85 and round_num >= 2:
+            if consensus_score >= 0.70:
                 p_body.print("✅ Consensus reached — skipping remaining rounds")
+                self._append_war_section("\n✅ Consensus reached — skipping remaining rounds\n")
                 break
 
             if round_num < max_rounds and consensus_score < 0.50:
@@ -415,13 +466,34 @@ class Think(Tool):
         elapsed = time.time() - start_time
 
         # ── Format final response ─────────────────────────────────────────────
-        result = self._format_result(
+        round_count = len([b for b in blackboard if b["round"] != "flash"])
+
+        # Verbose transcript → appended to the consolidated war log entry
+        verbose_log = self._format_verbose_log(
             blackboard=blackboard,
             synthesis=synthesis,
             synthesis_raw=synthesis_raw,
             elapsed=elapsed,
             panelists=panelists,
-            round_count=len([b for b in blackboard if b["round"] != "flash"]),
+            round_count=round_count,
+        )
+        self._war_log.update(
+            heading=(
+                f"🏛️ War Room — {elapsed:.0f}s | "
+                f"Conf: {synthesis.get('confidence', '?')} | "
+                f"{len(panelists)} panelists"
+            ),
+            update_progress="persistent",
+            content=verbose_log,
+        )
+
+        # Compact result → agent message history (~200-400 tokens)
+        compact = self._format_compact_result(
+            synthesis=synthesis,
+            synthesis_raw=synthesis_raw,
+            elapsed=elapsed,
+            panelists=panelists,
+            round_count=round_count,
         )
 
         p_head.print(
@@ -429,41 +501,101 @@ class Think(Tool):
             f"Confidence: {synthesis.get('confidence', '?')}"
         )
 
-        return Response(message=result, break_loop=False)
+        return Response(message=compact, break_loop=False)
 
     # ─────────────────────────────────────────────────────────────────────────
     #  INTERNAL HELPERS
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def _llm_call(self, messages: list, temperature: float = 0.2) -> str:
+    async def _llm_call(
+        self,
+        messages: list,
+        temperature: float = 0.2,
+        panelist_name: str = "",
+    ) -> str:
         """
         Call the War Room dedicated model (or fall back to main chat model).
-        Uses build_war_model() from the _model_config plugin so that war model
-        settings saved via WebUI Configure Models → War Room are respected.
+        Uses the cached war model from execute() when available.
+        Streams tokens to the WebUI in real-time via response_callback.
         Falls back to the agent's main chat model on any exception.
         """
-        war_display = "unknown"
+        war_display = getattr(self, "_war_model_resolved", "unknown")
         war_explicit = False
+
+        # ── Build streaming callback for real-time WebUI output ───────────
+        # Emits throttled heading/progress updates so users see live activity
+        # while tokens are being generated.
+        stream_label = panelist_name or "War Room"
+        _stream_char_count = 0
+        _last_emit_at = 0.0
+        _last_emit_chars = 0
+
+        async def _stream_cb(chunk: str, full: str) -> str | None:
+            nonlocal _stream_char_count, _last_emit_at, _last_emit_chars
+            _stream_char_count += len(chunk)
+            now = time.time()
+
+            # Throttle UI updates to avoid flooding; still keeps it feeling live.
+            if (_stream_char_count - _last_emit_chars) < 64 and (now - _last_emit_at) < 0.25:
+                return None
+
+            _last_emit_at = now
+            _last_emit_chars = _stream_char_count
+
+            try:
+                if self.agent and self.agent.context:
+                    status = f"🧠 {stream_label} generating… ({_stream_char_count} chars)"
+                    war_log = getattr(self, "_war_log", None)
+                    if war_log:
+                        war_log.update(
+                            heading=status,
+                            update_progress="temporary",
+                        )
+                        preview_text = full if len(full) <= 900 else (full[:300] + "\n...\n" + full[-500:])
+                        self._set_war_live_preview(
+                            f"[{stream_label}] live output",
+                            preview_text,
+                        )
+                    self.agent.context.log.set_progress(status, active=True)
+            except Exception:
+                pass  # Never let streaming display break the LLM call
+            return None
+
         try:
-            from plugins._model_config.helpers.model_config import (
-                build_war_model,
-                get_war_model_display,
-                get_config,
-            )
+            # Use cached war model if available; build fresh only as fallback
+            llm = getattr(self, "_cached_war_llm", None)
+            if llm is None:
+                from plugins._model_config.helpers.model_config import (
+                    build_war_model,
+                    get_war_model_display,
+                    get_config,
+                )
+                cfg = get_config(self.agent)
+                war_cfg = cfg.get("war_model", {}) if isinstance(cfg, dict) else {}
+                war_explicit = bool(
+                    isinstance(war_cfg, dict)
+                    and (war_cfg.get("provider") or war_cfg.get("name"))
+                )
+                war_display = get_war_model_display(self.agent)
+                self._war_model_resolved = war_display
+                llm = build_war_model(self.agent)
+            else:
+                # Determine if war model was explicitly configured
+                try:
+                    from plugins._model_config.helpers.model_config import get_config
+                    cfg = get_config(self.agent)
+                    war_cfg = cfg.get("war_model", {}) if isinstance(cfg, dict) else {}
+                    war_explicit = bool(
+                        isinstance(war_cfg, dict)
+                        and (war_cfg.get("provider") or war_cfg.get("name"))
+                    )
+                except Exception:
+                    pass
 
-            cfg = get_config(self.agent)
-            war_cfg = cfg.get("war_model", {}) if isinstance(cfg, dict) else {}
-            war_explicit = bool(
-                isinstance(war_cfg, dict)
-                and (war_cfg.get("provider") or war_cfg.get("name"))
-            )
-            war_display = get_war_model_display(self.agent)
-            self._war_model_resolved = war_display
-
-            llm = build_war_model(self.agent)
             response, _reasoning = await llm.unified_call(
                 messages=messages,
                 temperature=temperature,
+                response_callback=_stream_cb,
             )
             return (response or "").strip()
         except Exception as exc:
@@ -544,7 +676,13 @@ class Think(Tool):
             + (
                 f"\n\nThis is Round {round_num}. "
                 + ("Give your initial position." if round_num == 1
-                   else "React to at least ONE specific point from another panelist, then refine your position.")
+                   else (
+                       "CRITICAL: You MUST reference a specific panelist by name "
+                       "(e.g. 'STRATEGIST suggested X, but...'). "
+                       "State what CHANGED in your position vs Round 1. "
+                       "If nothing changed, explain WHY the same approach survives challenge. "
+                       "Do NOT repeat your Round 1 response verbatim."
+                   ))
             )
         )
 
@@ -552,7 +690,29 @@ class Think(Tool):
             SystemMessage(content=panelist["system"]),
             HumanMessage(content=human_content),
         ]
-        raw = await self._llm_call(msgs, temperature=0.25)
+        try:
+            raw = await asyncio.wait_for(
+                self._llm_call(
+                    msgs,
+                    temperature=0.25,
+                    panelist_name=panelist["name"],
+                ),
+                timeout=90,
+            )
+        except asyncio.TimeoutError:
+            raw = f"[TIMEOUT: {panelist['name']} did not respond within 90s]"
+            return {
+                "agent":      panelist["name"],
+                "role":       panelist["role"],
+                "round":      round_num,
+                "raw":        raw,
+                "structured": {
+                    "position": "timeout",
+                    "suggested_action": "timeout",
+                    "key_risk": "Panelist timed out after 90 seconds",
+                    "confidence": 0.0,
+                },
+            }
         structured = self._safe_json(raw)
 
         return {
@@ -585,6 +745,19 @@ class Think(Tool):
                 entry = await self._run_one_panelist(
                     p, problem, blackboard, round_num, env_hints
                 )
+            except asyncio.TimeoutError:
+                entry = {
+                    "agent":      p["name"],
+                    "role":       p["role"],
+                    "round":      round_num,
+                    "raw":        f"[TIMEOUT: {p['name']} did not respond within 90s]",
+                    "structured": {
+                        "position": "timeout",
+                        "suggested_action": "timeout",
+                        "key_risk": "Panelist timed out after 90 seconds",
+                        "confidence": 0.0,
+                    },
+                }
             except Exception as exc:
                 entry = {
                     "agent":      p["name"],
@@ -619,21 +792,17 @@ class Think(Tool):
                 f"  Conf:     {s.get('confidence', '?')}"
             )
             p_body.print(display)
-            self.agent.context.log.log(
-                type="tool",
-                heading=(
-                    f"{panelist.get('icon', '🧠')} War Room "
-                    f"[{entry['agent']}] Round {round_num}"
+
+            self._clear_war_live_preview()
+            self._append_war_section(
+                (
+                    f"[{entry['agent']}] {entry['role']} "
+                    f"(conf: {s.get('confidence', '?')})\n"
+                    f"  → Position: {s.get('position', entry['raw'][:120])}\n"
+                    f"  → Action: {s.get('suggested_action', '—')}\n\n"
                 ),
-                content=display,
-                kvps={
-                    "agent": entry["agent"],
-                    "role":  entry["role"],
-                    "round": str(round_num),
-                    "suggested_action": s.get("suggested_action", ""),
-                    "confidence": str(s.get("confidence", "")),
-                },
             )
+
             # Yield control so the WebSocket loop can push the update
             await asyncio.sleep(0)
 
@@ -735,12 +904,15 @@ class Think(Tool):
         ]
         raw = await self._llm_call(msgs, temperature=0.1)
 
-        # Log synthesizer output
-        self.agent.context.log.log(
-            type="tool",
-            heading=f"⚖️  War Room [SYNTHESIZER] — Final Consensus",
-            content=raw[:800],
-            kvps={"consensus_score": f"{consensus_score:.2f}"},
+        # Stream synthesizer output into consolidated war log
+        synthesis = self._safe_json(raw)
+        self._clear_war_live_preview()
+        self._append_war_section(
+            (
+                f"\n━━ SYNTHESIS ━━━━━━━━━━━━━━━\n"
+                f"Consensus: \"{synthesis.get('consensus_action', raw[:200])}\"\n"
+                f"Confidence: {synthesis.get('confidence', '?')}\n"
+            ),
         )
         return raw
 
@@ -764,7 +936,15 @@ class Think(Tool):
         return "\n".join(lines).strip()
 
     def _compute_consensus(self, entries: list[dict]) -> float:
-        """Jaccard similarity on suggested_action tokens. Returns 0-1."""
+        """Normalized token overlap with confidence boost. Returns 0-1."""
+        _STOP_WORDS = frozenset({
+            "the", "a", "to", "and", "or", "of", "in", "for",
+            "with", "using", "via", "is", "it", "be", "on", "at",
+            "by", "an", "as", "do", "if", "no", "not", "but",
+            "this", "that", "from", "are", "was", "were", "been",
+            "will", "can", "has", "have", "had", "should", "would",
+        })
+
         actions = [
             e.get("structured", {}).get("suggested_action", e.get("raw", ""))
             for e in entries
@@ -773,7 +953,8 @@ class Think(Tool):
             return 1.0
 
         def tok(text: str) -> set[str]:
-            return set(re.findall(r"\b\w{3,}\b", text.lower()))
+            words = set(re.findall(r"\b\w+\b", text.lower()))
+            return {w for w in words if len(w) >= 4 and w not in _STOP_WORDS}
 
         sets = [tok(a) for a in actions]
         scores: list[float] = []
@@ -785,8 +966,20 @@ class Think(Tool):
                 elif not a or not b:
                     scores.append(0.0)
                 else:
-                    scores.append(len(a & b) / len(a | b))
-        return sum(scores) / len(scores) if scores else 1.0
+                    # Overlap coefficient: |A∩B| / min(|A|,|B|)
+                    scores.append(len(a & b) / min(len(a), len(b)))
+
+        base_score = sum(scores) / len(scores) if scores else 1.0
+
+        # Confidence proximity boost: if all panelists within 0.15, add 0.2
+        confidences = [
+            float(e.get("structured", {}).get("confidence", 0.5))
+            for e in entries
+        ]
+        if confidences and (max(confidences) - min(confidences)) <= 0.15:
+            base_score += 0.2
+
+        return min(base_score, 1.0)
 
     def _safe_json(self, raw: str) -> dict:
         """Extract JSON from a string; returns {} on failure."""
@@ -809,7 +1002,76 @@ class Think(Tool):
             pass
         return {}
 
-    def _format_result(
+    def _refresh_war_log_content(self) -> None:
+        war_log = getattr(self, "_war_log", None)
+        if not war_log:
+            return
+
+        sections = list(getattr(self, "_war_live_sections", []))
+        preview = getattr(self, "_war_live_preview", "")
+        content = "".join(sections)
+        if preview:
+            content += f"\n━━ Live Generation ━━━━━━━━━━━━━━━\n{preview.strip()}\n"
+        war_log.update(content=content)
+
+    def _append_war_section(self, text: str) -> None:
+        sections = getattr(self, "_war_live_sections", None)
+        if sections is None:
+            self._war_live_sections = []
+            sections = self._war_live_sections
+        sections.append(text)
+        self._refresh_war_log_content()
+
+    def _set_war_live_preview(self, title: str, body: str = "") -> None:
+        body = (body or "").strip()
+        self._war_live_preview = title if not body else f"{title}\n{body}"
+        self._refresh_war_log_content()
+
+    def _clear_war_live_preview(self) -> None:
+        self._war_live_preview = ""
+        self._refresh_war_log_content()
+
+    def _format_compact_result(
+        self,
+        synthesis: dict,
+        synthesis_raw: str,
+        elapsed: float,
+        panelists: list[dict],
+        round_count: int,
+    ) -> str:
+        """Build a compact result for the agent's message history (~200-400 tokens)."""
+        faz = synthesis.get("for_agent_zero", {})
+
+        risks = synthesis.get("key_risks", [])
+        risks_str = "; ".join(risks) if risks else "none identified"
+
+        dissent = synthesis.get("dissent_notes", [])
+        dissent_str = "; ".join(dissent) if dissent else "none"
+
+        lines = [
+            f"# War Room Consensus ({elapsed:.1f}s, {len(panelists)} panelists, {round_count} rounds)",
+            "",
+            f"**Consensus:** {synthesis.get('consensus_action', 'See synthesis below')}",
+            f"**Confidence:** {synthesis.get('confidence', '?')}",
+            f"**Key Risks:** {risks_str}",
+            f"**Dissent:** {dissent_str}",
+        ]
+
+        if faz:
+            lines += [
+                "",
+                "## FOR_AGENT_ZERO:",
+                "```json",
+                json.dumps(faz, indent=2),
+                "```",
+                "Execute the recommended tool call above immediately.",
+            ]
+        else:
+            lines += ["```", synthesis_raw[:600], "```"]
+
+        return "\n".join(lines)
+
+    def _format_verbose_log(
         self,
         blackboard: list[dict],
         synthesis: dict,
@@ -818,7 +1080,7 @@ class Think(Tool):
         panelists: list[dict],
         round_count: int,
     ) -> str:
-        """Build the final Response.message string."""
+        """Build the full verbose transcript for WebUI display only."""
         faz = synthesis.get("for_agent_zero", {})
         lines = [
             f"# 🏛️ War Room Complete — {elapsed:.1f}s | {round_count} round(s) | {len(panelists)} panelists",
@@ -864,28 +1126,27 @@ class Think(Tool):
             "",
         ]
 
-        # Include the for_agent_zero block so the main agent can copy it
         if faz:
             lines += [
-                "## 🎯 FOR_AGENT_ZERO (execute this next):",
+                "## 🎯 FOR_AGENT_ZERO:",
                 "```json",
                 json.dumps(faz, indent=2),
                 "```",
-                "",
-                "**Read the JSON block above. Use `tool_name` and `tool_args` as your next action.**",
-                "**Do NOT say 'I will do X' — emit the JSON tool call directly.**",
             ]
         else:
-            # fallback: include raw synthesis
             lines += ["```", synthesis_raw[:1200], "```"]
 
         return "\n".join(lines)
 
     def get_log_object(self) -> Any:
+        import uuid
+
+        pre_id = str(uuid.uuid4())
         return self.agent.context.log.log(
             type="tool",
             heading=f"🏛️ {self.agent.agent_name} — War Room Thinking",
-            content="",
+            content="Initializing War Room...",
             kvps=self.args,
-            tool_name=self.name,
+            _tool_name=self.name,
+            id=pre_id,
         )

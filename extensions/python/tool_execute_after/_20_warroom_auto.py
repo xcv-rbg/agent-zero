@@ -1,8 +1,8 @@
 # extensions/python/tool_execute_after/_20_warroom_auto.py
 # ─────────────────────────────────────────────────────────────────────────────
 #  War Room — Automatic Post-Tool Analysis Extension
-#  Fires after every significant tool execution.
-#  Runs a mini War Room on the tool result and stores analysis for next prompt.
+#  Fires after significant tool executions that contain ERRORS ONLY.
+#  Non-error results are left for the main agent to handle directly.
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -14,12 +14,19 @@ from helpers.tool import Response
 # Tools that should never trigger a post-tool war room (would cause recursion
 # or are too trivial to warrant multi-agent analysis)
 _SKIP_TOOLS = frozenset({
-    "think",         # recursion guard
-    "response",      # final answer — no further analysis
-    "memory_tool",   # memory ops are bookkeeping, not analysis targets
+    "think",              # recursion guard
+    "response",           # final answer — no further analysis
+    "memory_tool",        # memory ops are bookkeeping, not analysis targets
+    "browseros.list_pages",      # trivial listing
+    "browseros.take_snapshot",   # observation only
+    "browseros.take_screenshot", # observation only
+    "search_engine",      # search results are self-explanatory
+    "document_query",     # document query results are self-explanatory
+    "skills_tool:load",
+    "skills_tool:list"
 })
 
-# Error-indicating patterns that ESCALATE complexity (force analysis mode)
+# Error-indicating patterns that trigger auto-analysis
 _ERROR_PATTERNS = re.compile(
     r"\b(error|exception|traceback|failed|failure|denied|not found|"
     r"permission|eacces|enoent|segfault|crash|timeout|refused|"
@@ -32,7 +39,7 @@ _BINARY_PATTERN = re.compile(r"[A-Za-z0-9+/]{60,}={0,2}")
 
 
 class WarRoomAutoAnalysis(Extension):
-    """Automatically runs a War Room analysis after significant tool executions."""
+    """Runs a War Room analysis ONLY after tool executions that produce errors."""
 
     async def execute(
         self,
@@ -58,34 +65,24 @@ class WarRoomAutoAnalysis(Extension):
         if _BINARY_PATTERN.search(result_text[:200]):
             return
 
-        # ── Decide mode ───────────────────────────────────────────────────────
-        has_errors = bool(_ERROR_PATTERNS.search(result_text[:1000]))
-
-        if has_errors:
-            # Error analysis always gets targeted attention
-            think_mode = "analysis"
-        elif result_len > 500:
-            # Long result — let the router decide
-            think_mode = ""   # empty = router decides
-        else:
-            # Short-medium non-error result — lightweight execution mode
-            think_mode = "execution"
+        # # ── ONLY auto-analyze errors — let main agent handle success ──────────
+        # has_errors = bool(_ERROR_PATTERNS.search(result_text[:1000]))
+        # if not has_errors:
+        #     return  # Non-error results don't need a War Room
 
         # ── Build the problem statement ───────────────────────────────────────
-        truncated     = result_text[:800] if result_len > 800 else result_text
-        error_context = result_text[:600] if has_errors else ""
+        truncated     = result_text[:2800] if result_len > 2800 else result_text
+        error_context = result_text[:2600]
 
         problem = (
-            f"Tool '{tool_name}' just executed. Analyze the result and determine "
-            f"the best next action.\n\nTOOL RESULT:\n{truncated}"
+            f"Tool '{tool_name}' returned an error. Diagnose the root cause and "
+            f"determine the best fix/next action.\n\nERROR OUTPUT:\n{truncated}"
         )
 
-        # ── Run War Room internally ───────────────────────────────────────────
+        # ── Run War Room internally (analysis mode for errors) ────────────────
         try:
             from tools.think import Think
 
-            # Construct the Think tool directly (same signature as Tool.__init__):
-            # agent, name, method, args, message, loop_data
             think_tool = Think(
                 agent=self.agent,
                 name="think",
@@ -93,7 +90,7 @@ class WarRoomAutoAnalysis(Extension):
                 args={
                     "problem":       problem,
                     "error_context": error_context,
-                    "mode":          think_mode,
+                    "mode":          "analysis",
                 },
                 message=problem,
                 loop_data=self.agent.loop_data,
@@ -101,13 +98,9 @@ class WarRoomAutoAnalysis(Extension):
             war_result = await think_tool.execute(
                 problem=problem,
                 error_context=error_context,
-                mode=think_mode,
+                mode="analysis",
             )
 
-            # Store synthesis for injection into the NEXT iteration's prompt.
-            # params_temporary is cleared at the start of each inner loop
-            # iteration, so we use params_persistent which survives until the
-            # next message_loop_prompts_before picks it up and pops it.
             if war_result and war_result.message:
                 self.agent.loop_data.params_persistent["warroom_post_tool"] = (
                     war_result.message
