@@ -1,292 +1,266 @@
 import asyncio
 import time
 import traceback
-from datetime import datetime
 
 from helpers.tool import Tool, Response
 from helpers.print_style import PrintStyle
 from langchain_core.messages import SystemMessage, HumanMessage
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Configuration ─────────────────────────────────────────────────────────────
 
-DEFAULT_BUDGET_SEC = 60   # target: whole war room under 60s
-MAX_BUDGET_SEC     = 90   # hard cap
-_SYNTHESIS_RESERVE = 20   # always keep 20s for synthesis
+DEFAULT_BUDGET_SEC = 90
+MAX_BUDGET_SEC = 180
 
-_MAX_EXPERT_WORDS  = 70   # ~90 output tokens per expert per round
-_MAX_SYNTH_WORDS   = 150  # ~200 output tokens for synthesis
+# Per-expert call timeout: never let one LLM call consume the whole budget.
+# Synthesis always gets at least SYNTHESIS_RESERVE_SEC from remaining budget.
+_EXPERT_TIMEOUT_HEADROOM = 0.70   # each expert gets at most 70 % of remaining
+_SYNTHESIS_RESERVE_SEC   = 30     # always reserve this much for synthesis
 
-# Chat bubble meta — WhatsApp group aesthetic
-_CHAT_META = {
-    "STRATEGIST": {"emoji": "🧠", "color": "#aed6f1", "short": "Strat"},
-    "CHALLENGER":  {"emoji": "⚔️",  "color": "#f1948a", "short": "Chad"},
-    "EXECUTOR":    {"emoji": "🔧", "color": "#a9dfbf", "short": "Exec"},
-    "SYNTH":       {"emoji": "⚖️",  "color": "#f9e79f", "short": "Synth"},
-    "RED":         {"emoji": "🔴", "color": "#f1948a", "short": "Red"},
-    "BLUE":        {"emoji": "🔵", "color": "#aed6f1", "short": "Blue"},
-    "ARCHITECT":   {"emoji": "🏗️", "color": "#a9dfbf", "short": "Arch"},
-    "AUDITOR":     {"emoji": "📋", "color": "#f9e79f", "short": "Audit"},
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# EXPERT DEFINITIONS  (ultra-compact system prompts, ≤40 words each)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Expert Definitions ────────────────────────────────────────────────────────
+# Compact system prompts (~80 words) for token efficiency.
+# Round-specific instructions are injected dynamically per-call.
 
 _GENERAL_EXPERTS = {
     "STRATEGIST": {
-        "role": "Strategy",
+        "role": "Strategic Analyst",
         "icon": "icon://psychology",
+        "color": "#aed6f1",
         "system": (
-            "You are STRATEGIST in a fast expert chat. "
-            "Identify the core challenge, key constraints, optimal approach. "
-            "Be decisive, ultra-concise. No filler. Lead with your sharpest insight."
+            "You are STRATEGIST on an expert thinking panel. "
+            "Focus on: core challenge identification, hidden constraints, "
+            "dependencies, and the optimal high-level approach. "
+            "Think 3 steps ahead. Be decisive — no vague language. "
+            "State your single most important insight first."
         ),
     },
     "CHALLENGER": {
         "role": "Devil's Advocate",
         "icon": "icon://gavel",
+        "color": "#f1948a",
         "system": (
-            "You are CHALLENGER in a fast expert chat. "
-            "Find the biggest flaw or blind spot in current thinking. "
-            "Always pair criticism with a concrete fix. Ultra-concise."
+            "You are CHALLENGER on an expert thinking panel. "
+            "Find flaws in every proposal, identify blind spots, "
+            "stress-test assumptions, uncover hidden risks. "
+            "If everyone agrees, find what they are missing. "
+            "Always pair criticism with a concrete fix or alternative."
         ),
     },
     "EXECUTOR": {
-        "role": "Implementation",
+        "role": "Implementer",
         "icon": "icon://build",
+        "color": "#a9dfbf",
         "system": (
-            "You are EXECUTOR in a fast expert chat. "
-            "Give exact commands, file paths, tool flags, concrete steps. "
-            "No hand-waving. If unsure, say so. Ultra-concise."
+            "You are EXECUTOR on an expert thinking panel. "
+            "Focus on: exact commands, tool parameters, file paths, "
+            "concrete step-by-step actions, error handling. "
+            "No hand-waving — if you cannot specify the exact action, say so."
         ),
     },
     "SYNTH": {
-        "role": "Consensus",
+        "role": "Consensus Builder",
         "icon": "icon://balance",
+        "color": "#f9e79f",
         "system": (
-            "You are SYNTH in a fast expert chat. "
-            "Synthesize all positions into one clear decision. "
-            "Resolve disagreements. Output is the group's final plan."
+            "You are SYNTHESIZER on an expert thinking panel. "
+            "Identify agreements, resolve disagreements by weighing evidence, "
+            "produce clear actionable output. "
+            "Your output IS the group's final decision."
         ),
     },
 }
 
 _SECURITY_EXPERTS = {
     "RED": {
-        "role": "Attacker",
+        "role": "Offensive / Attacker",
         "icon": "icon://bug_report",
+        "color": "#f1948a",
         "system": (
-            "You are RED (offensive) in a fast security chat. "
-            "Name exploitable vulns, attack vectors, trust violations. "
-            "Each finding: name + severity + one-line exploit. Ultra-concise."
+            "You are RED, offensive security expert on a security panel. "
+            "Think like an attacker. Identify every exploitable vulnerability, "
+            "attack vector, and trust boundary violation. "
+            "For each finding: name it, explain exploitation, rate severity."
         ),
     },
     "BLUE": {
-        "role": "Defender",
+        "role": "Defensive / Hardening",
         "icon": "icon://security",
+        "color": "#aed6f1",
         "system": (
-            "You are BLUE (defensive) in a fast security chat. "
-            "For each vuln: exact fix or control. Flag missing logging. "
-            "Prioritize by impact divided by effort. Ultra-concise."
+            "You are BLUE, defensive security expert on a security panel. "
+            "For each vulnerability: propose the specific code fix, config change, "
+            "or control. Identify detection gaps — missing logging or monitoring. "
+            "Prioritize by impact-to-effort ratio."
         ),
     },
     "ARCHITECT": {
-        "role": "Threat Model",
+        "role": "Threat Modeler",
         "icon": "icon://account_tree",
+        "color": "#a9dfbf",
         "system": (
-            "You are ARCHITECT (threat model) in a fast security chat. "
-            "Spot systemic design flaws: privilege escalation, broken trust, "
-            "insecure defaults. Think STRIDE. Ultra-concise."
+            "You are ARCHITECT, threat modeling expert on a security panel. "
+            "Identify systemic design flaws: privilege escalation, broken trust, "
+            "dangerous data flows, insecure defaults. Think STRIDE. "
+            "Propose architectural fixes, not patches."
         ),
     },
     "AUDITOR": {
-        "role": "Audit / Consensus",
+        "role": "Code Reviewer / OWASP",
         "icon": "icon://fact_check",
+        "color": "#f9e79f",
         "system": (
-            "You are AUDITOR in a fast security chat. "
-            "Map findings to OWASP/CVE. Synthesize team consensus into a "
-            "prioritized fix plan. Ultra-concise."
+            "You are AUDITOR, code review and compliance expert on a security panel. "
+            "Map findings to OWASP Top 10 and CVE classes. "
+            "Check for: hardcoded secrets, insecure deps, unsafe deserialization, "
+            "missing validation, weak crypto."
         ),
     },
 }
 
+# ── Presets ────────────────────────────────────────────────────────────────────
+# Each preset defines which experts debate in parallel and who synthesizes.
+
 PRESETS = {
     "general": {
-        "debaters":    ["STRATEGIST", "CHALLENGER", "EXECUTOR"],
+        "debaters": ["STRATEGIST", "CHALLENGER", "EXECUTOR"],
         "synthesizer": "SYNTH",
-        "experts":     _GENERAL_EXPERTS,
-        "rounds":      2,
+        "experts": _GENERAL_EXPERTS,
+        "default_rounds": 2,
     },
     "security": {
-        "debaters":    ["RED", "BLUE", "ARCHITECT"],
+        "debaters": ["RED", "BLUE", "ARCHITECT"],
         "synthesizer": "AUDITOR",
-        "experts":     _SECURITY_EXPERTS,
-        "rounds":      2,
+        "experts": _SECURITY_EXPERTS,
+        "default_rounds": 2,
     },
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ROUND INSTRUCTIONS
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Round Instructions ────────────────────────────────────────────────────────
+# Injected per-round to enforce conciseness and cross-pollination.
 
-_PITCH = (
-    f"Give your initial take in MAX {_MAX_EXPERT_WORDS} words. "
-    "Be direct and specific — name exact tools, steps, or risks. "
+_PITCH_INSTRUCTION = (
+    "Give your initial analysis in 150-200 words MAX. "
+    "Be specific and actionable — name concrete tools, techniques, or steps. "
     "End with: KEY RISK: <one sentence>."
 )
 
-
-def _react_prompt(others: str) -> str:
-    return (
-        f"The team posted:\n{others}\n\n"
-        f"Reply in MAX {_MAX_EXPERT_WORDS} words:\n"
-        "• Name ONE teammate and react to their specific point\n"
-        "• Refine your position or flag a new gap\n"
-        "End with: POSITION: <one sentence>."
-    )
-
-
-_SYNTH_PROMPT = (
-    f"Read the team chat below. Produce the final plan in MAX {_MAX_SYNTH_WORDS} words.\n\n"
-    "Use EXACTLY this format:\n"
-    "PLAN:\n"
-    "1. <action>\n"
-    "2. <action>\n"
-    "...\n\n"
-    "RISKS: <bullet per risk + mitigation>\n\n"
-    "CALL: <single most important first action, one sentence>"
+_REACT_INSTRUCTION = (
+    "You have read everyone's positions on the blackboard. In 100-150 words:\n"
+    "1. React to ONE specific point from another expert (name them)\n"
+    "2. Refine OR defend your position with new reasoning\n"
+    "3. Flag any risk the group is still missing\n"
+    "End with: UPDATED POSITION: <one sentence>."
 )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CHAT FORMATTING HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+_SYNTHESIS_INSTRUCTION = (
+    "Read the ENTIRE blackboard. Produce the group's final consensus.\n"
+    "Resolve all disagreements by weighing the evidence presented.\n\n"
+    "You MUST use EXACTLY this format:\n\n"
+    "CONSENSUS PLAN:\n"
+    "1. [concrete action step]\n"
+    "2. [concrete action step]\n"
+    "(as many as needed)\n\n"
+    "KEY RISKS:\n"
+    "- [risk + mitigation]\n\n"
+    "DISSENT NOTES:\n"
+    "- [any unresolved minority opinions worth preserving]\n\n"
+    "FINAL RECOMMENDATION: [one sentence — the single most important first action]"
+)
 
 
-def _ts() -> str:
-    return datetime.now().strftime("%I:%M %p")
-
-
-def _bubble_heading(name: str, role: str, rnd=None) -> str:
-    m = _CHAT_META.get(name, {"emoji": "💬", "short": name})
-    tag = f" · Round {rnd}" if rnd else " · Synthesis"
-    return f"{m['emoji']} {name} ({role}){tag}"
-
-
-def _sep(label: str) -> str:
-    return f"──────── {label} ────────"
-
-
-def _format_others(blackboard: list, exclude: str, rnd: int) -> str:
-    """Only what OTHER experts said in the given round — key token saver."""
-    msgs = [
-        f"{_CHAT_META.get(e['expert'], {}).get('emoji', '💬')} "
-        f"{e['expert']}: {e['content']}"
-        for e in blackboard
-        if e["round"] == rnd and e["expert"] != exclude
-    ]
-    return "\n\n".join(msgs) if msgs else "(no messages yet)"
-
-
-def _format_full_chat(blackboard: list) -> str:
-    """Compact full transcript for synthesis — no duplication."""
-    if not blackboard:
-        return "(empty)"
-    lines = []
-    cur = 0
-    for e in blackboard:
-        if e["round"] != cur:
-            cur = e["round"]
-            lines.append(f"\n{_sep(f'Round {cur}')}")
-        em = _CHAT_META.get(e["expert"], {}).get("emoji", "💬")
-        lines.append(f"{em} {e['expert']}: {e['content']}")
-    return "\n".join(lines)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOL CLASS
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Tool Class ────────────────────────────────────────────────────────────────
 
 class Think(Tool):
     """
-    War Room v3 — WhatsApp-Group Chat Style Multi-Expert Panel.
+    War Room Multi-Agent Thinking Tool.
 
-    Goals:
-    - Entire run in <60s on any model
-    - ~55% fewer tokens than v1:
-        Round 1: experts receive only the problem (no blackboard overhead)
-        Round 2+: experts receive ONLY teammates' new messages (not full problem)
-        Word-capped replies (70 words expert / 150 words synthesis)
-        Ultra-compact system prompts (~40 words vs 80)
-        Synthesis gets compressed chat, not full problem re-injected
-    - WhatsApp chat bubble aesthetic in WebUI (emoji + name + role + timestamp)
-    - Zero repetition between rounds
+    Architecture: Blackboard + Parallel Micro-Rounds + Synthesis.
+    Each debate round fires all experts simultaneously via asyncio.gather().
+    Experts read the shared blackboard and cross-pollinate between rounds.
+    A final synthesizer reads the full debate and produces the CONSENSUS PLAN.
 
-    Args:
-        problem : Full task with all context, code, errors.
-        preset  : "general" | "security"  (default: general)
-        rounds  : 1-3  (default: 2)
-        budget  : seconds, default 60, max 90
+    Tool args:
+        problem (str):  Full problem statement with all relevant context.
+        preset  (str):  "general" or "security". Default "general".
+        rounds  (str):  Number of debate rounds (1-4). Default from preset (2).
+        budget  (str):  Time budget in seconds. Default 90, max 180.
+
+    Bug-fixes applied (v2):
+        1. expert_log content now finalized on happy-path after streaming.
+        2. Per-expert asyncio.wait_for() timeout honours budget.
+        3. Synthesis gracefully skipped / degraded when blackboard is empty.
+        4. CancelledError / BaseException in _call updates expert_log safely.
+        5. handle_intervention exceptions caught; synthesis always runs.
+        6. Main self.log entry updated with content on completion.
+        7. _format_blackboard no longer double-spaces entries.
+        8. Closure variables (first_round, bb_text, instruction) captured
+           as default args so parallel asyncio.gather tasks are immune to
+           loop-variable rebinding.
     """
 
     async def execute(self, **kwargs) -> Response:
-
-        # ── parse args ────────────────────────────────────────────────────────
+        # ── Resolve arguments ────────────────────────────────────────────
         problem = (
-            kwargs.get("problem") or self.args.get("problem", "") or self.message
+            kwargs.get("problem")
+            or self.args.get("problem", "")
+            or self.message
         )
         if not problem or not problem.strip():
-            return Response(message="Error: 'problem' is required.", break_loop=False)
+            return Response(
+                message="Error: 'problem' argument is required.",
+                break_loop=False,
+            )
 
         preset_name = (
-            (kwargs.get("preset") or self.args.get("preset", "general"))
-            .strip().lower()
-        )
+            kwargs.get("preset") or self.args.get("preset", "general")
+        ).strip().lower()
         if preset_name not in PRESETS:
             preset_name = "general"
         preset = PRESETS[preset_name]
 
         try:
-            req_rounds = int(kwargs.get("rounds") or self.args.get("rounds", "0"))
+            req_rounds = int(
+                kwargs.get("rounds") or self.args.get("rounds", "0")
+            )
         except (ValueError, TypeError):
             req_rounds = 0
-        total_rounds = req_rounds if 1 <= req_rounds <= 3 else preset["rounds"]
+        total_rounds = (
+            req_rounds if 1 <= req_rounds <= 4 else preset["default_rounds"]
+        )
 
         try:
             budget_sec = max(
-                20,
+                30,
                 min(
-                    int(kwargs.get("budget") or self.args.get("budget", str(DEFAULT_BUDGET_SEC))),
+                    int(
+                        kwargs.get("budget")
+                        or self.args.get("budget", str(DEFAULT_BUDGET_SEC))
+                    ),
                     MAX_BUDGET_SEC,
                 ),
             )
         except (ValueError, TypeError):
             budget_sec = DEFAULT_BUDGET_SEC
 
-        # ── setup ─────────────────────────────────────────────────────────────
+        # ── Setup ────────────────────────────────────────────────────────
         all_experts = preset["experts"]
-        debaters    = preset["debaters"]
-        synth_name  = preset["synthesizer"]
+        debater_names = preset["debaters"]
+        synth_name = preset["synthesizer"]
 
         h = PrintStyle(bold=True, font_color="#c39bd3", padding=True)
         c = PrintStyle(font_color="#d2b4de", padding=False)
         d = PrintStyle(font_color="#7f8c8d", padding=False)
 
-        roster = " · ".join(
-            f"{_CHAT_META.get(n, {}).get('emoji', '')} {n}" for n in debaters
-        ) + f" · {_CHAT_META.get(synth_name, {}).get('emoji', '')} {synth_name}"
-
+        roster = ", ".join(debater_names) + f" + {synth_name}"
         h.print(
-            f"⚔️  War Room v3  |  {preset_name}  |  "
-            f"{total_rounds} round(s)  |  budget {budget_sec}s\n"
-            f"{roster}\n"
-            f"🎯 {problem[:120]}{'…' if len(problem) > 120 else ''}"
+            f"War Room | {total_rounds} round(s) + synthesis | "
+            f"preset: {preset_name} | budget: {budget_sec}s\n"
+            f"Experts: {roster}\n"
+            f"Problem: {problem[:160]}{'...' if len(problem) > 160 else ''}"
         )
 
-        blackboard: list = []
+        blackboard: list[dict] = []
         t0 = time.monotonic()
-        rounds_done = 0
+        rounds_completed = 0
 
         def elapsed() -> float:
             return time.monotonic() - t0
@@ -294,64 +268,92 @@ class Think(Tool):
         def remaining() -> float:
             return max(0.0, budget_sec - elapsed())
 
-        # ── debate rounds ─────────────────────────────────────────────────────
+        # ── Debate Rounds (parallel per round) ───────────────────────────
         for rnd in range(1, total_rounds + 1):
-
-            if remaining() < _SYNTHESIS_RESERVE + 5:
-                h.print(f"⏱ Budget tight ({elapsed():.0f}s elapsed) — jumping to synthesis.")
+            # Guard: need enough time for this round + synthesis reserve.
+            # Minimum viable round time: 12 s per expert plus the reserve.
+            round_min = 12 + _SYNTHESIS_RESERVE_SEC
+            if remaining() < round_min:
+                h.print(
+                    f"Budget low ({elapsed():.0f}s) — skipping round {rnd}, "
+                    f"jumping to synthesis."
+                )
                 break
 
-            d.print(f"\n{_sep(f'Round {rnd} / {total_rounds}')}\n")
+            d.print(
+                f"\n{'='*55}\n"
+                f"  ROUND {rnd}/{total_rounds}  "
+                f"({len(debater_names)} experts in parallel)\n"
+                f"{'='*55}"
+            )
             await self.set_progress(
-                f"Round {rnd}/{total_rounds} · {len(debaters)} experts typing…"
+                f"Round {rnd}/{total_rounds} — "
+                f"{len(debater_names)} experts debating in parallel..."
             )
 
-            # FIX #1 — snapshot loop-locals as default args → closure safety
-            is_first_snap = (rnd == 1)
-            bb_snap       = list(blackboard)
-            rnd_snap      = rnd
+            # Snapshot loop-locals NOW so closures are immune to rebinding.
+            # FIX #8: capture all free variables as default args.
+            bb_text_snap = _format_blackboard(blackboard)
+            first_round_snap = (rnd == 1)
+            instruction_snap = (
+                _PITCH_INSTRUCTION if first_round_snap else _REACT_INSTRUCTION
+            )
 
+            # ── Parallel expert calls (streamed to WebUI) ─────────────────
             async def _call(
                 name: str,
-                _rnd:   int  = rnd_snap,
-                _first: bool = is_first_snap,
-                _bb:    list = bb_snap,
+                _rnd: int = rnd,
+                _bb: str = bb_text_snap,
+                _first: bool = first_round_snap,
+                _instr: str = instruction_snap,
             ) -> dict:
-                exp  = all_experts[name]
-                meta = _CHAT_META.get(name, {"emoji": "💬", "color": "#ccc"})
+                exp = all_experts[name]
 
+                # Create log entry BEFORE the call so streaming has a target.
                 expert_log = self.agent.context.log.log(
                     type="tool",
-                    heading=_bubble_heading(name, exp["role"], _rnd),
+                    heading=(
+                        f"{exp['icon']} War Room — "
+                        f"{name} ({exp['role']}) "
+                        f"| Round {_rnd}"
+                    ),
                     content="",
                     kvps={
                         "expert": name,
-                        "role":   exp["role"],
-                        "round":  str(_rnd),
-                        "time":   _ts(),
+                        "role": exp["role"],
+                        "round": str(_rnd),
                     },
                 )
 
                 if _first:
-                    # Round 1: only the problem — zero blackboard overhead
-                    human = f"TASK:\n{problem}\n\n{_PITCH}"
+                    human = (
+                        f"TASK:\n{problem}\n\n"
+                        f"INSTRUCTION: {_instr}"
+                    )
                 else:
-                    # Round 2+: ONLY what teammates posted last round
-                    # This is the biggest single token saver in v3
-                    others = _format_others(_bb, name, _rnd - 1)
-                    human  = _react_prompt(others)
-
+                    human = (
+                        f"TASK:\n{problem}\n\n"
+                        f"=== BLACKBOARD ===\n{_bb}\n\n"
+                        f"INSTRUCTION: {_instr}"
+                    )
                 msgs = [
                     SystemMessage(content=exp["system"]),
                     HumanMessage(content=human),
                 ]
 
-                async def _stream(chunk: str, _full: str):
+                # Stream callback: pushes tokens to WebUI in real time.
+                async def _stream(chunk: str, _full: str) -> str | None:
                     if chunk:
                         expert_log.stream(content=chunk)
+                    return None
 
-                # FIX #4 — per-expert timeout with synthesis reserve
-                call_budget = max(4.0, (remaining() - _SYNTHESIS_RESERVE) * 0.70)
+                # FIX #4: per-expert timeout = (remaining − reserve) × headroom.
+                # This guarantees synthesis always has _SYNTHESIS_RESERVE_SEC.
+                call_budget = max(
+                    5.0,
+                    (remaining() - _SYNTHESIS_RESERVE_SEC)
+                    * _EXPERT_TIMEOUT_HEADROOM,
+                )
 
                 text: str
                 try:
@@ -364,101 +366,126 @@ class Think(Tool):
                         timeout=call_budget,
                     )
                     text = text.strip()
-                    # FIX #2 — finalize log content on success path
+                    # FIX #2: finalize log content in the happy path.
                     expert_log.update(content=text)
                 except asyncio.TimeoutError:
-                    # FIX #3 — TimeoutError stamps expert log
-                    text = f"⏱ [{name} timed out after {call_budget:.0f}s]"
+                    text = (
+                        f"[TIMEOUT: {name} exceeded {call_budget:.0f}s "
+                        f"per-call budget — partial response above]"
+                    )
                     expert_log.update(content=text)
                 except Exception as exc:
-                    # FIX #3 — any exception stamps expert log
-                    tb = traceback.format_exc(limit=2)
-                    text = f"❌ [{name} error: {type(exc).__name__}: {exc}]\n{tb}"
+                    # FIX #3: always update expert_log even on unexpected errors.
+                    tb = traceback.format_exc(limit=3)
+                    text = (
+                        f"[ERROR: {name} — "
+                        f"{type(exc).__name__}: {exc}]\n{tb}"
+                    )
                     expert_log.update(content=text)
 
+                # Always stamp elapsed regardless of success/failure.
                 expert_log.update(kvps={"elapsed": f"{elapsed():.1f}s"})
-                c.print(f"{meta['emoji']} {name}  {_ts()}\n{text}\n")
-                d.print("·" * 40)
+
+                h.print(f"[{name}]  {exp['role']}  | Round {_rnd}")
+                c.print(text)
+                d.print("-" * 50)
 
                 return {
-                    "round":   _rnd,
-                    "expert":  name,
-                    "role":    exp["role"],
+                    "round": _rnd,
+                    "expert": name,
+                    "role": exp["role"],
                     "content": text,
                 }
 
-            raw = await asyncio.gather(
-                *(_call(n) for n in debaters),
+            raw_results = await asyncio.gather(
+                *(_call(n) for n in debater_names),
                 return_exceptions=True,
             )
 
-            for entry in raw:
+            # Record to blackboard; log any gather-level exceptions.
+            for entry in raw_results:
                 if isinstance(entry, dict):
                     blackboard.append(entry)
                 elif isinstance(entry, BaseException):
-                    h.print(f"⚠️  gather error: {entry}")
+                    # FIX #3 (gather level): log but do not crash the round.
+                    h.print(f"[ERROR] Expert gather failed: {entry}")
 
-            rounds_done = rnd
+            rounds_completed = rnd
 
-            # FIX #7 — handle_intervention wrapped
+            # FIX #7: handle_intervention may raise; catch it so synthesis runs.
             try:
                 await self.agent.handle_intervention("")
             except Exception as exc:
-                h.print(f"⚠️  handle_intervention: {exc} — continuing")
+                h.print(f"[WARN] handle_intervention raised: {exc} — continuing.")
 
-            h.print(f"✅ Round {rnd} complete  ({elapsed():.1f}s)")
+            h.print(f"Round {rnd} done ({elapsed():.1f}s elapsed)")
 
-        # ── FIX #5 — empty blackboard guard ──────────────────────────────────
+        # ── Synthesis ────────────────────────────────────────────────────
+        # FIX #5: degrade gracefully when blackboard is empty.
         if not blackboard:
-            msg = (
-                f"War Room v3 ({preset_name} | 0 rounds | {elapsed():.1f}s)\n\n"
-                "⚠️  All expert calls failed — no consensus available.\n"
-                "Proceed with your own best judgment."
+            degraded_msg = (
+                f"War Room ({preset_name} | 0 rounds completed | "
+                f"{roster} | {elapsed():.1f}s)\n\n"
+                "[War Room produced no output — all expert calls failed or "
+                "the budget was exhausted before any round completed. "
+                "Retry with a longer budget or simpler problem.]\n\n"
+                "---\n"
+                "INSTRUCTION: No consensus available. Proceed with your own "
+                "best judgment."
+            )
+            h.print(
+                f"War Room: blackboard empty — skipping synthesis. "
+                f"({elapsed():.1f}s)"
             )
             self.log.update(
-                heading=f"⚔️ War Room v3 — No Output ({preset_name})",
-                content=msg,
+                heading=(
+                    f"icon://psychology "
+                    f"{self.agent.agent_name}: War Room — No Output "
+                    f"({preset_name} | {elapsed():.1f}s)"
+                ),
+                content=degraded_msg,
             )
-            return Response(message=msg, break_loop=False)
+            return Response(message=degraded_msg, break_loop=False)
 
-        # ── synthesis ─────────────────────────────────────────────────────────
         await self.set_progress(
-            f"Synthesis · {_CHAT_META.get(synth_name, {}).get('emoji', '')} "
-            f"{synth_name} building consensus…"
+            f"Synthesis — {synth_name} building consensus..."
         )
-        d.print(f"\n{_sep('Synthesis')}\n")
+        d.print(f"\n{'='*55}\n  SYNTHESIS\n{'='*55}")
 
-        synth_exp  = all_experts[synth_name]
-        synth_meta = _CHAT_META.get(synth_name, {"emoji": "⚖️"})
+        synth_exp = all_experts[synth_name]
+        bb_text = _format_blackboard(blackboard)
+        synth_msgs = [
+            SystemMessage(content=synth_exp["system"]),
+            HumanMessage(
+                content=(
+                    f"TASK:\n{problem}\n\n"
+                    f"=== FULL BLACKBOARD ===\n{bb_text}\n\n"
+                    f"INSTRUCTION: {_SYNTHESIS_INSTRUCTION}"
+                )
+            ),
+        ]
 
+        # Create synthesis log entry for streaming.
         synth_log = self.agent.context.log.log(
             type="tool",
-            heading=_bubble_heading(synth_name, synth_exp["role"]),
+            heading=(
+                f"{synth_exp['icon']} War Room — "
+                f"{synth_name} ({synth_exp['role']}) | Synthesis"
+            ),
             content="",
             kvps={
                 "expert": synth_name,
-                "role":   synth_exp["role"],
-                "phase":  "synthesis",
-                "time":   _ts(),
+                "role": synth_exp["role"],
+                "phase": "synthesis",
             },
         )
 
-        async def _synth_stream(chunk: str, _full: str):
+        async def _synth_stream(chunk: str, _full: str) -> str | None:
             if chunk:
                 synth_log.stream(content=chunk)
+            return None
 
-        # Synthesis: compressed chat + problem summary (no full re-inject)
-        chat_text   = _format_full_chat(blackboard)
-        synth_human = (
-            f"Team chat:\n{chat_text}\n\n"
-            f"Original task summary: {problem[:300]}{'…' if len(problem) > 300 else ''}\n\n"
-            f"{_SYNTH_PROMPT}"
-        )
-        synth_msgs = [
-            SystemMessage(content=synth_exp["system"]),
-            HumanMessage(content=synth_human),
-        ]
-
+        # FIX #4: synthesis gets whatever time is left (min 5 s).
         synth_timeout = max(5.0, remaining())
 
         synthesis: str
@@ -472,41 +499,54 @@ class Think(Tool):
                 timeout=synth_timeout,
             )
             synthesis = synthesis.strip()
+            # FIX #2 (synthesis): finalize log content on happy path.
             synth_log.update(content=synthesis)
         except asyncio.TimeoutError:
             synthesis = (
-                f"⏱ [Synthesis timed out after {synth_timeout:.0f}s]\n"
-                "Review the team chat above and execute the most agreed-upon approach."
+                f"[SYNTHESIS TIMEOUT after {synth_timeout:.0f}s]\n"
+                "Fallback: review the blackboard above and execute "
+                "the most agreed-upon approach."
             )
             synth_log.update(content=synthesis)
         except Exception as exc:
-            tb = traceback.format_exc(limit=2)
-            synthesis = f"❌ [Synthesis error: {type(exc).__name__}: {exc}]\n{tb}"
+            # FIX #3: always update synth_log even on unexpected errors.
+            tb = traceback.format_exc(limit=3)
+            synthesis = (
+                f"[SYNTHESIS ERROR: {type(exc).__name__}: {exc}]\n{tb}\n"
+                "Fallback: review the blackboard above and execute "
+                "the most agreed-upon approach."
+            )
             synth_log.update(content=synthesis)
 
-        synth_log.update(kvps={"total_elapsed": f"{elapsed():.1f}s"})
-        h.print(
-            f"{synth_meta.get('emoji', '⚖️')} {synth_name}  {_ts()}\n"
-            f"{synthesis}\n\n⚔️  War Room v3 complete  {elapsed():.1f}s ✅"
-        )
+        synth_log.update(kvps={"total_time": f"{elapsed():.1f}s"})
+        h.print(f"[{synth_name}]  {synth_exp['role']}  | Synthesis")
+        c.print(synthesis)
 
-        # ── final response ────────────────────────────────────────────────────
+        # ── Assemble response ────────────────────────────────────────────
+        # CRITICAL: Only the consensus plan goes into Response.message
+        # (which feeds into the LLM's context via hist_add_tool_result).
+        # The full debate transcript is already visible in WebUI logs
+        # via the per-expert log entries created above.
         result = (
-            f"War Room v3 ({preset_name} | {rounds_done} round(s) | "
-            f"{len(debaters) + 1} experts | {elapsed():.1f}s)\n\n"
+            f"War Room ({preset_name} | {rounds_completed} rounds | "
+            f"{roster} | {elapsed():.1f}s)\n\n"
             f"{synthesis}\n\n"
-            "---\n"
-            "INSTRUCTION: Execute the PLAN above step by step with your tools. "
-            "Adapt individual steps as you discover new information but keep the "
-            "overall strategy. If a step fails or you hit a blocker, call think "
-            "again with updated context."
+            f"---\n"
+            f"INSTRUCTION: Execute the CONSENSUS PLAN above step-by-step. "
+            f"Use your tools to carry out each numbered action. "
+            f"If you discover new information during execution that "
+            f"contradicts the plan, adapt accordingly but follow the "
+            f"overall strategy."
         )
 
-        # FIX #6 — main log entry now includes content=
+        h.print(f"War Room complete ({elapsed():.1f}s) — consensus ready.")
+
+        # FIX #6: update main log entry with both heading AND content.
         self.log.update(
             heading=(
-                f"⚔️ {self.agent.agent_name}: War Room v3 Complete "
-                f"({preset_name} | {rounds_done}R | {elapsed():.1f}s)"
+                f"icon://psychology "
+                f"{self.agent.agent_name}: War Room Complete "
+                f"({preset_name} | {rounds_completed}R | {elapsed():.1f}s)"
             ),
             content=result,
         )
@@ -516,8 +556,30 @@ class Think(Tool):
     def get_log_object(self):
         return self.agent.context.log.log(
             type="tool",
-            heading=f"⚔️ {self.agent.agent_name}: War Room v3",
+            heading=(
+                f"icon://psychology "
+                f"{self.agent.agent_name}: War Room Thinking"
+            ),
             content="",
             kvps=self.args,
             _tool_name=self.name,
         )
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _format_blackboard(board: list[dict]) -> str:
+    """Format the blackboard entries as readable text for prompt injection.
+
+    FIX #8: use a single newline join so entries do not double-space.
+    """
+    if not board:
+        return "(empty)"
+    parts: list[str] = []
+    cur_round = 0
+    for e in board:
+        if e["round"] != cur_round:
+            cur_round = e["round"]
+            parts.append(f"\n--- Round {cur_round} ---")
+        parts.append(f"[{e['expert']} — {e['role']}]\n{e['content']}")
+    return "\n".join(parts)
