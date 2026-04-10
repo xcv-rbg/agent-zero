@@ -1,0 +1,506 @@
+/* ==========================================================================
+   War Room Todo Panel — Clean Sidebar Design
+   ========================================================================== */
+
+/* Root wrappers – transparent in flex layout */
+.todo-panel-root,
+.todo-panel-inner {
+  display: contents;
+}
+
+/* Panel body */
+.todo-panel-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  gap: 0;
+  padding-bottom: 4px;
+}
+
+/* ---------- Header ---------- */
+.todo-header-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.todo-header-icon {
+  font-size: 18px;
+  opacity: 0.7;
+}
+
+.todo-header-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.todo-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--color-secondary);
+  border: 1px solid var(--color-border);
+  transition: all 0.3s ease;
+}
+
+.todo-badge-active {
+  background: rgba(67, 97, 238, 0.15);
+  color: #7b93f5;
+  border-color: rgba(67, 97, 238, 0.3);
+}
+
+.todo-badge-done {
+  background: rgba(42, 157, 143, 0.15);
+  color: #2a9d8f;
+  border-color: rgba(42, 157, 143, 0.3);
+}
+
+.light-mode .todo-badge {
+  background: rgba(0, 0, 0, 0.04);
+}
+.light-mode .todo-badge-active {
+  background: rgba(67, 97, 238, 0.08);
+  color: #2540b3;
+}
+.light-mode .todo-badge-done {
+  background: rgba(42, 157, 143, 0.08);
+  color: #1a6f65;
+}
+
+/* ---------- Progress Bar (thin strip) ---------- */
+.todo-progress-bar {
+  width: 100%;
+  height: 2px;
+  background: var(--color-border);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.todo-progress-fill {
+  height: 100%;
+  background: #4361ee;
+  transition: width 0.4s ease;
+  border-radius: 0 1px 1px 0;
+}
+
+/* ---------- Task List ---------- */
+.todo-list-container {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.todo-list {
+  list-style: none;
+  margin: 0;
+  padding: 2px 0;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+/* ---------- Task Item ---------- */
+.todo-item {
+  position: relative;
+  transition: opacity 0.2s ease;
+}
+
+.todo-item--done {
+  opacity: 0.45;
+}
+
+.todo-item--active {
+  /* Subtle left accent for the active task */
+}
+
+.todo-item--active > .todo-item-row {
+  background: rgba(67, 97, 238, 0.06);
+}
+
+.light-mode .todo-item--active > .todo-item-row {
+  background: rgba(67, 97, 238, 0.04);
+}
+
+.todo-item--blocked > .todo-item-row {
+  background: rgba(230, 57, 70, 0.04);
+}
+
+.todo-item-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 4px;
+  transition: background-color 0.12s ease;
+  min-height: 28px;
+}
+
+.todo-item-row:hover {
+  background: var(--color-background-hover);
+}
+
+/* ---------- Status Check Circle ---------- */
+.todo-check {
+  flex-shrink: 0;
+  background: none;
+  border: 1.5px solid var(--color-secondary);
+  padding: 0;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  margin-top: 2px;
+  transition: all 0.15s ease;
+  color: transparent;
+}
+
+.todo-check .material-symbols-outlined {
+  font-size: 12px;
+  transition: color 0.15s ease;
+}
+
+/* Pending: empty circle */
+.todo-check--pending {
+  border-color: var(--color-secondary);
+  color: transparent;
+}
+.todo-check--pending:hover {
+  border-color: #4361ee;
+  background: rgba(67, 97, 238, 0.1);
+}
+
+/* In progress: blue filled with sync icon */
+.todo-check--in_progress {
+  border-color: #4361ee;
+  background: rgba(67, 97, 238, 0.15);
+  color: #4361ee;
+}
+.todo-check--in_progress .material-symbols-outlined {
+  color: #4361ee;
+  font-size: 11px;
+  animation: todoSpin 2s linear infinite;
+}
+
+/* Done: green filled with check */
+.todo-check--done {
+  border-color: #2a9d8f;
+  background: #2a9d8f;
+  color: white;
+}
+.todo-check--done .material-symbols-outlined {
+  color: white;
+  font-size: 12px;
+}
+
+/* Blocked: red */
+.todo-check--blocked {
+  border-color: #e63946;
+  background: rgba(230, 57, 70, 0.15);
+  color: #e63946;
+}
+.todo-check--blocked .material-symbols-outlined {
+  color: #e63946;
+  font-size: 11px;
+}
+
+/* Small variant for subtasks */
+.todo-check--sm {
+  width: 15px;
+  height: 15px;
+}
+.todo-check--sm .material-symbols-outlined {
+  font-size: 10px;
+}
+
+/* ---------- Task Content ---------- */
+.todo-item-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  cursor: default;
+  user-select: none;
+}
+
+.todo-item-title {
+  font-size: var(--font-size-small);
+  line-height: 1.4;
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.todo-item--done .todo-item-title {
+  text-decoration: line-through;
+  color: var(--color-secondary);
+}
+
+.todo-item-desc {
+  font-size: 10px;
+  color: var(--color-secondary);
+  opacity: 0.7;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.3;
+}
+
+/* ---------- Priority Dot ---------- */
+.todo-priority-dot {
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-top: 7px;
+}
+
+.todo-priority-dot--critical {
+  background: #e63946;
+  box-shadow: 0 0 4px rgba(230, 57, 70, 0.4);
+}
+
+.todo-priority-dot--high {
+  background: #f4a261;
+  box-shadow: 0 0 4px rgba(244, 162, 97, 0.3);
+}
+
+/* ---------- Item Delete (hover-reveal) ---------- */
+.todo-item-delete {
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  padding: 1px;
+  margin-top: 1px;
+}
+
+.todo-item-delete .material-symbols-outlined {
+  font-size: 14px;
+}
+
+.todo-item-row:hover .todo-item-delete {
+  opacity: 0.5;
+}
+
+.todo-item-delete:hover {
+  opacity: 1 !important;
+  color: #e63946 !important;
+}
+
+/* ---------- Subtasks ---------- */
+.todo-subtasks {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 18px;
+}
+
+.todo-item--sub .todo-item-row {
+  padding: 3px 6px;
+  min-height: 22px;
+}
+
+.todo-item--sub .todo-item-title {
+  font-size: 11px;
+}
+
+/* ---------- Inline Edit ---------- */
+.todo-edit {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+}
+
+.todo-edit-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--color-panel);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  color: var(--color-text);
+  font-size: var(--font-size-small);
+  padding: 4px 8px;
+  outline: none;
+  box-sizing: border-box;
+  font-family: inherit;
+}
+
+.todo-edit-input:focus {
+  border-color: var(--color-primary);
+}
+
+.todo-edit-actions {
+  display: flex;
+  gap: 2px;
+}
+
+.todo-edit-actions .material-symbols-outlined {
+  font-size: 16px;
+}
+
+/* ---------- Add Task Form ---------- */
+.todo-add-form {
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px 2px;
+  border-top: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.todo-add-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  color: var(--color-text);
+  font-size: var(--font-size-small);
+  padding: 5px 8px;
+  outline: none;
+  box-sizing: border-box;
+  font-family: inherit;
+  transition: border-color 0.15s ease;
+}
+
+.todo-add-input:focus {
+  border-color: var(--color-primary);
+}
+
+.todo-add-input::placeholder {
+  color: var(--color-secondary);
+  opacity: 0.5;
+}
+
+.todo-add-btn {
+  flex-shrink: 0;
+  padding: 4px;
+}
+
+.todo-add-btn:disabled {
+  opacity: 0.2;
+  cursor: not-allowed;
+}
+
+.todo-add-btn .material-symbols-outlined {
+  font-size: 18px;
+}
+
+/* ---------- Empty State ---------- */
+.todo-panel-body .empty-list-message {
+  height: 50px;
+  font-size: 11px;
+  opacity: 0.6;
+}
+
+/* ---------- Animations ---------- */
+@keyframes todoSpin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+@keyframes todoCheckPop {
+  0%   { transform: scale(1); }
+  50%  { transform: scale(1.3); }
+  100% { transform: scale(1); }
+}
+
+@keyframes todoPulse {
+  0%   { box-shadow: 0 0 0 0 rgba(67, 97, 238, 0.4); }
+  70%  { box-shadow: 0 0 0 5px rgba(67, 97, 238, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(67, 97, 238, 0); }
+}
+
+@keyframes todoSlideIn {
+  from { opacity: 0; transform: translateY(-4px) scale(0.95); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.todo-check--done {
+  animation: todoCheckPop 0.3s ease;
+}
+
+.todo-check--in_progress {
+  animation: todoPulse 2s ease infinite;
+}
+
+/* ---------- Status Wrapper ---------- */
+.todo-status-wrapper {
+  position: relative;
+  flex-shrink: 0;
+}
+
+/* ---------- Status Dropdown Menu ---------- */
+.todo-status-menu {
+  position: absolute;
+  top: 100%;
+  left: -4px;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  min-width: 130px;
+  padding: 3px;
+  margin-top: 4px;
+  background: var(--color-panel);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+  animation: todoSlideIn 0.12s ease-out;
+}
+
+.todo-status-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-text);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background-color 0.1s ease;
+  white-space: nowrap;
+}
+
+.todo-status-option:hover {
+  background: var(--color-background-hover);
+}
+
+.todo-status-option--active {
+  background: rgba(67, 97, 238, 0.08);
+  font-weight: 600;
+}
+
+/* Mini check circles inside the menu */
+.todo-check--menu {
+  width: 14px;
+  height: 14px;
+  pointer-events: none;
+  animation: none !important;
+}
+
+.todo-check--menu .material-symbols-outlined {
+  font-size: 9px;
+}
+
+/* ---------- Responsive ---------- */
+@media (max-width: 480px) {
+  .todo-item-delete {
+    opacity: 0.5;
+  }
+}

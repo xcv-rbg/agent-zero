@@ -147,6 +147,8 @@ def _find_explicit_war_scope_override(agent=None) -> tuple[dict, bool]:
     Important: we inspect raw config files so we can distinguish between:
     - key absent (inherit from broader scope)
     - key present but blank (intentional inherit-main override at this scope)
+    - key present but identical to chat_model at the same scope (auto-filled,
+      NOT intentionally configured — skip and try broader scopes)
     """
     project_name, agent_profile = _get_agent_scope(agent)
     scoped_configs = plugins.find_plugin_assets(
@@ -171,7 +173,20 @@ def _find_explicit_war_scope_override(agent=None) -> tuple[dict, bool]:
             continue
 
         war_cfg = cfg.get("war_model")
-        return (war_cfg if isinstance(war_cfg, dict) else {}), True
+        if not isinstance(war_cfg, dict):
+            war_cfg = {}
+
+        # Skip this scope if war_model is identical to chat_model at the same
+        # scope — this means it was auto-filled by the UI save, not explicitly
+        # configured by the user.  Allow the search to continue to a broader
+        # scope where the real war_model may be defined.
+        chat_cfg = cfg.get("chat_model")
+        if isinstance(chat_cfg, dict) and war_cfg.get("provider") and war_cfg.get("name"):
+            if (war_cfg.get("provider") == chat_cfg.get("provider")
+                    and war_cfg.get("name") == chat_cfg.get("name")):
+                continue
+
+        return war_cfg, True
 
     return {}, False
 

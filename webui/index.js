@@ -14,6 +14,7 @@ import { store as chatTopStore } from "/components/chat/top-section/chat-top-sto
 import { store as _tooltipsStore } from "/components/tooltips/tooltip-store.js";
 import { store as messageQueueStore } from "/components/chat/message-queue/message-queue-store.js";
 import { store as syncStore } from "/components/sync/sync-store.js"
+import { store as todoStore } from "/components/sidebar/todo/todo-store.js"
 
 globalThis.fetchApi = api.fetchApi; // TODO - backward compatibility for non-modular scripts, remove once refactored to alpine
 
@@ -378,6 +379,15 @@ export async function applySnapshot(snapshot, options = {}) {
   let tasks = snapshot.tasks || [];
   tasksStore.applyTasks(tasks);
 
+  // Refresh todo list if a context is active (throttled to every 5s)
+  if (context && todoStore.contextId) {
+    const now = Date.now();
+    if (!todoStore._lastPollRefresh || now - todoStore._lastPollRefresh > 5000) {
+      todoStore._lastPollRefresh = now;
+      todoStore.refresh();
+    }
+  }
+
   // Make sure the active context is properly selected in both lists
   if (context) {
     // Update selection in both stores
@@ -559,6 +569,10 @@ export const setContext = function (id) {
   // Update both selected states using stores
   chatsStore.setSelected(id);
   tasksStore.setSelected(id);
+
+  // Update todo store context and refresh
+  todoStore.setContext(id);
+  if (id) todoStore.refresh();
 
   // Trigger a new WS handshake for the newly selected context (push-based sync).
   // This keeps the UI current without needing /poll during healthy operation.

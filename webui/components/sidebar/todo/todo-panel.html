@@ -1,0 +1,216 @@
+<html>
+<head>
+  <script type="module">
+    import { store } from "/components/sidebar/todo/todo-store.js";
+  </script>
+</head>
+<body>
+  <div class="todo-panel-root">
+    <template x-if="$store.todo">
+      <div x-data class="todo-panel-inner">
+        <!-- Section Header -->
+        <h3 class="section-header section-header-collapsible"
+            @click="$store.sidebar.toggleSection('todo')"
+            x-effect="!$store.sidebar.isSectionOpen('todo') ? $el.classList.add('collapsed') : $el.classList.remove('collapsed')">
+          <span class="todo-header-text">
+            <span class="material-symbols-outlined todo-header-icon">checklist</span>
+            War Room Plan
+          </span>
+          <span class="todo-header-right">
+            <template x-if="$store.todo.items.length > 0">
+              <span class="todo-badge"
+                    :class="{
+                      'todo-badge-done': $store.todo.progressPercent() === 100,
+                      'todo-badge-active': $store.todo.progress.in_progress > 0 && $store.todo.progressPercent() < 100
+                    }"
+                    x-text="($store.todo.progress.done || 0) + '/' + ($store.todo.progress.total || 0)"></span>
+            </template>
+            <svg class="arrow-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+                 fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+              <path d="M8 4l8 8-8 8" />
+            </svg>
+          </span>
+        </h3>
+
+        <!-- Collapsible body -->
+        <div class="collapse" id="todo-collapse"
+             x-effect="(() => { const c = bootstrap.Collapse.getOrCreateInstance($el, { toggle: false }); $store.sidebar.isSectionOpen('todo') ? c.show() : c.hide(); })()">
+          <div class="todo-panel-body">
+
+            <!-- Progress bar (thin, always visible when tasks exist) -->
+            <template x-if="$store.todo.items.length > 0">
+              <div class="todo-progress-bar">
+                <div class="todo-progress-fill"
+                     :style="'width:' + $store.todo.progressPercent() + '%'"></div>
+              </div>
+            </template>
+
+            <!-- Task list -->
+            <div class="todo-list-container">
+              <ul class="todo-list no-scrollbar" x-show="$store.todo.items.length > 0">
+                <template x-for="(task, index) in $store.todo.topLevelTasks()" :key="task.id">
+                  <li class="todo-item"
+                      :class="{
+                        'todo-item--done': task.status === 'done',
+                        'todo-item--active': task.status === 'in_progress',
+                        'todo-item--blocked': task.status === 'blocked'
+                      }">
+
+                    <!-- Inline edit mode -->
+                    <template x-if="$store.todo.editingId === task.id">
+                      <div class="todo-edit">
+                        <input type="text" class="todo-edit-input"
+                               x-model="$store.todo.editTitle"
+                               @keydown.enter="$store.todo.saveEdit(task.id)"
+                               @keydown.escape="$store.todo.cancelEdit()"
+                               x-init="$nextTick(() => $el.focus())"
+                               placeholder="Task title" />
+                        <div class="todo-edit-actions">
+                          <button class="btn-icon-action" @click="$store.todo.saveEdit(task.id)" title="Save">
+                            <span class="material-symbols-outlined">check</span>
+                          </button>
+                          <button class="btn-icon-action" @click="$store.todo.cancelEdit()" title="Cancel">
+                            <span class="material-symbols-outlined">close</span>
+                          </button>
+                        </div>
+                      </div>
+                    </template>
+
+                    <!-- Normal view -->
+                    <template x-if="$store.todo.editingId !== task.id">
+                      <div class="todo-item-row">
+                        <!-- Status indicator (click to cycle, right-click for menu) -->
+                        <div class="todo-status-wrapper" @click.away="$store.todo.statusMenuId === task.id && $store.todo.closeStatusMenu()">
+                          <button class="todo-check"
+                                  :class="'todo-check--' + (task.status || 'pending')"
+                                  @click="$store.todo.toggleStatus(task.id, task.status)"
+                                  @contextmenu.prevent="$store.todo.toggleStatusMenu(task.id)"
+                                  :title="$store.todo.statusLabel(task.status) + ' (right-click for options)'">
+                            <span class="material-symbols-outlined"
+                                  x-text="$store.todo.statusIcon(task.status)"></span>
+                          </button>
+                          <!-- Status dropdown menu -->
+                          <template x-if="$store.todo.statusMenuId === task.id">
+                            <div class="todo-status-menu">
+                              <template x-for="st in $store.todo.allStatuses()" :key="st">
+                                <button class="todo-status-option"
+                                        :class="{'todo-status-option--active': st === task.status}"
+                                        @click="$store.todo.setStatus(task.id, st)">
+                                  <span class="todo-check todo-check--menu"
+                                        :class="'todo-check--' + st">
+                                    <span class="material-symbols-outlined"
+                                          x-text="$store.todo.statusIcon(st)"></span>
+                                  </span>
+                                  <span x-text="$store.todo.statusLabel(st)"></span>
+                                </button>
+                              </template>
+                            </div>
+                          </template>
+                        </div>
+
+                        <!-- Task content -->
+                        <div class="todo-item-content"
+                             @dblclick="$store.todo.startEdit(task.id)">
+                          <span class="todo-item-title" x-text="task.title"
+                                :title="task.description || task.title"></span>
+                          <template x-if="task.description && task.status !== 'done'">
+                            <span class="todo-item-desc" x-text="task.description"></span>
+                          </template>
+                        </div>
+
+                        <!-- Priority dot -->
+                        <template x-if="task.priority === 'high' || task.priority === 'critical'">
+                          <span class="todo-priority-dot"
+                                :class="'todo-priority-dot--' + task.priority"
+                                :title="task.priority + ' priority'"></span>
+                        </template>
+
+                        <!-- Delete (appears on hover) -->
+                        <button class="btn-icon-action todo-item-delete"
+                                @click="$confirmClick($event, () => $store.todo.removeTask(task.id))"
+                                title="Remove">
+                          <span class="material-symbols-outlined">close</span>
+                        </button>
+                      </div>
+                    </template>
+
+                    <!-- Subtasks -->
+                    <template x-if="task.subtasks && task.subtasks.length > 0">
+                      <ul class="todo-subtasks">
+                        <template x-for="sub in task.subtasks" :key="sub.id">
+                          <li class="todo-item todo-item--sub"
+                              :class="{'todo-item--done': sub.status === 'done'}">
+                            <div class="todo-item-row">
+                              <div class="todo-status-wrapper" @click.away="$store.todo.statusMenuId === sub.id && $store.todo.closeStatusMenu()">
+                                <button class="todo-check todo-check--sm"
+                                        :class="'todo-check--' + (sub.status || 'pending')"
+                                        @click="$store.todo.toggleStatus(sub.id, sub.status)"
+                                        @contextmenu.prevent="$store.todo.toggleStatusMenu(sub.id)">
+                                  <span class="material-symbols-outlined"
+                                        x-text="$store.todo.statusIcon(sub.status)"></span>
+                                </button>
+                                <template x-if="$store.todo.statusMenuId === sub.id">
+                                  <div class="todo-status-menu">
+                                    <template x-for="st in $store.todo.allStatuses()" :key="st">
+                                      <button class="todo-status-option"
+                                              :class="{'todo-status-option--active': st === sub.status}"
+                                              @click="$store.todo.setStatus(sub.id, st)">
+                                        <span class="todo-check todo-check--menu"
+                                              :class="'todo-check--' + st">
+                                          <span class="material-symbols-outlined"
+                                                x-text="$store.todo.statusIcon(st)"></span>
+                                        </span>
+                                        <span x-text="$store.todo.statusLabel(st)"></span>
+                                      </button>
+                                    </template>
+                                  </div>
+                                </template>
+                              </div>
+                              <div class="todo-item-content">
+                                <span class="todo-item-title" x-text="sub.title"></span>
+                              </div>
+                              <button class="btn-icon-action todo-item-delete"
+                                      @click="$confirmClick($event, () => $store.todo.removeTask(sub.id))"
+                                      title="Remove">
+                                <span class="material-symbols-outlined">close</span>
+                              </button>
+                            </div>
+                          </li>
+                        </template>
+                      </ul>
+                    </template>
+                  </li>
+                </template>
+              </ul>
+
+              <!-- Empty state -->
+              <div class="empty-list-message" x-show="$store.todo.items.length === 0 && $store.todo.contextId">
+                <p><i>War Room will populate tasks here.</i></p>
+              </div>
+              <div class="empty-list-message" x-show="!$store.todo.contextId">
+                <p><i>Open a chat to see the plan.</i></p>
+              </div>
+            </div>
+
+            <!-- Add task form -->
+            <template x-if="$store.todo.contextId">
+              <div class="todo-add-form">
+                <input type="text" class="todo-add-input"
+                       x-model="$store.todo.newTaskTitle"
+                       @keydown.enter="$store.todo.addTask($store.todo.newTaskTitle)"
+                       placeholder="Add task…" />
+                <button class="btn-icon-action todo-add-btn"
+                        @click="$store.todo.addTask($store.todo.newTaskTitle)"
+                        :disabled="!$store.todo.newTaskTitle.trim()">
+                  <span class="material-symbols-outlined">add</span>
+                </button>
+              </div>
+            </template>
+
+          </div>
+        </div>
+      </div>
+    </template>
+  </div>
+</body>
+</html>

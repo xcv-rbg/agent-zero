@@ -9,6 +9,7 @@ const model = {
   // Centralized collapse state for all sidebar sections (persisted in localStorage)
   sectionStates: {
     tasks: false,       // default: collapsed
+    todo: false,        // default: collapsed
     preferences: false  // default: collapsed
   },
 

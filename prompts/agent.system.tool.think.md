@@ -3,14 +3,27 @@
 Use this tool to convene a **War Room** of expert agents before executing any complex, ambiguous, risky, or multi-step task.
 
 ### What it does
-Runs a panel of 1–5 expert sub-LLM calls in parallel micro-rounds on a shared blackboard.
-Each expert (STRATEGIST, CHALLENGER, EXECUTOR, RESEARCHER, CRITIC) reads all prior contributions before responding.
-A separate **SYNTHESIZER** is always called last to produce a final, concrete, machine-readable decision.
+Runs a panel of 1–12 domain-specialist sub-LLM calls in parallel micro-rounds on a shared blackboard.
+Core panelists (STRATEGIST, CHALLENGER, EXECUTOR, RESEARCHER, CRITIC, TACTICIAN) plus domain specialists
+(PENTEST_SPECIALIST, DEFENDER, CLOUD_ARCHITECT, CODE_AUDITOR, DEBUGGER, REVERSE_ENGINEER) are auto-selected
+based on problem domain.
 
-The Complexity Router automatically decides agent count and round count:
-- **HIGH** (4 agents, 3 rounds): security analysis, novel planning, architecture decisions, risky/irreversible actions, first encounter with a problem
-- **MEDIUM** (3 agents, 2 rounds): result analysis, tool output interpretation, error diagnosis
-- **LOW** (1 agent, 1 round): simple follow-up in an already established plan
+Key v2.0 capabilities:
+- **Novelty-based termination**: Runs until idea exhaustion, not fixed round limits. Consensus is logged but never stops exploration.
+- **IdeaRegistry**: Semantic deduplication tracks every idea by keyword fingerprint — prevents rehashing, surfaces endorsement counts.
+- **Progressive depth**: explore → debate → deep dive → edge hunt phases with adaptive temperature per role.
+- **Dead end protocol**: After 3 consecutive stale rounds, LLM confirms no angles remain (with evidence). Formally declares termination.
+- **Lateral thinking injection**: When stuck, cycles through inversion/analogical/constraint-removal frames to break out of ruts.
+- **Cross-session memory**: Loads relevant past War Room syntheses; saves results to JSONL for future sessions.
+- **Speculative synthesis**: Background synthesis starts after round 1; reused if round 2 produces no novelty.
+- **Blackboard pruning**: Keeps top entries per round by endorsement × confidence score to manage context window.
+
+The Complexity Router (with fast-path heuristic) automatically decides agent count and phase depth:
+- **CRITICAL** (6 agents, up to 25 rounds): zero-day, architecture, threat modeling — includes decomposition pre-pass
+- **HIGH** (4-5 agents, dynamic rounds): security, complex planning, error analysis with unclear cause
+- **MEDIUM** (3 agents, 2 rounds): result analysis, moderate debugging, tool output interpretation
+- **LOW** (2 agents, 1-2 rounds): simple follow-up in an established plan
+- **TRIVIAL** (1 agent, 1 round): lookup, file listing, obvious next step
 
 ### When to use
 
@@ -34,14 +47,38 @@ The Complexity Router automatically decides agent count and round count:
 |-----|----------|-------------|
 | `problem` | required | Full problem statement. Include all context: code snippets, file paths, error messages, constraints, what you've already tried. |
 | `error_context` | optional | stderr/stdout from a failed tool call. Enables environment diagnostics mode (auto-detects missing packages, permission errors, shell issues, and adds repair steps). |
-| `mode` | optional | Override router: `"planning"` \| `"analysis"` \| `"execution"`. Omit to let the Complexity Router decide automatically. |
+| `mode` | optional | Override router: `"planning"` \| `"analysis"` \| `"execution"` \| `"fast"`. Omit to let the Complexity Router decide. `"fast"` forces 2 agents, 2 rounds, 45s time budget. |
+| `time_budget_seconds` | optional | Max wall-clock seconds for the session (int, default 0 = unlimited). Reserves 15s for final synthesis. |
+
+### Structural notes
+- The War Room runs until **idea exhaustion** (novelty ratio drops below 8% for 3 consecutive rounds), not round limits.
+- **Consensus is never a stop signal** — high consensus is logged but exploration continues if new ideas emerge.
+- **Dead ends are formally declared** with evidence: total rounds, unique ideas explored, blocked approaches, and LLM confirmation.
 
 ### After the tool returns
 
-Read the `FOR_AGENT_ZERO` JSON block at the end of the response.
-**Use `tool_name` and `tool_args` exactly as given for your next action.**
-Do not paraphrase or say "I will do X" — emit the JSON tool call directly.
-You may adapt individual steps only if you discover new information the panel did not have.
+The War Room populates a **todo list** with action items ONLY on the **first planning call** for a task.
+
+**Planning mode (first War Room call for a new task):**
+1. Read the `FOR_AGENT_ZERO` JSON block — this is your **immediate next action**.
+2. **Execute that action first** using `tool_name` and `tool_args` exactly as given.
+3. After completing the first action, use `todo:next` to get the next task from the War Room's plan.
+4. Work through all todo items sequentially. Mark each `in_progress` when you start, `done` when you finish using `todo:update`.
+5. **After marking a task done**, a War Room validation session automatically runs to verify the task was done correctly. If the validation finds issues, address them before moving to the next task.
+6. When ALL tasks are done, the War Room performs a **final validation**. Your final response to the user will only be allowed after this validation passes.
+
+**Tactical mode (calling think mid-task to get advice):**
+When you're already working through a plan and call `think` to analyze a specific problem or error:
+- The War Room will NOT populate the todo list (existing plan is preserved).
+- Just read the synthesis advice and continue working on your current task.
+- Use `mode: "fast"` for quick tactical analysis during task execution.
+
+**Error recovery:**
+If a tool call fails or crashes, DO NOT start over. Check `todo:list` to see your current plan state, and resume from where you left off. Try an alternative approach if the first one failed.
+
+**Do NOT use think as a substitute for working.** If you have a clear plan with pending todo items, execute them. Only call think when you're genuinely stuck or need expert analysis on a specific sub-problem.
+
+**CRITICAL: You cannot send a final `response` to the user while there are incomplete tasks.** The system will block your response until all tasks are done and the War Room has validated the work.
 
 ### example
 

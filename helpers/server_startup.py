@@ -35,6 +35,7 @@ class StartupConfig:
     timeout_seconds: int
     max_attempts: int
     retry_delay_seconds: float
+    h11_max_incomplete_event_size: int
 
     @classmethod
     def from_env(cls) -> "StartupConfig":
@@ -43,6 +44,9 @@ class StartupConfig:
             max_attempts=_env_int("A0_STARTUP_MAX_ATTEMPTS", 2, minimum=1),
             retry_delay_seconds=_env_float(
                 "A0_STARTUP_RETRY_DELAY_SECONDS", 2.0, minimum=0.0
+            ),
+            h11_max_incomplete_event_size=_env_int(
+                "A0_H11_MAX_INCOMPLETE_EVENT_SIZE", 262144, minimum=16384
             ),
         )
 
@@ -273,6 +277,7 @@ def run_uvicorn_with_retries(
                 access_log=access_log,
                 log_level=log_level,
                 ws=ws,
+                h11_max_incomplete_event_size=startup_config.h11_max_incomplete_event_size,
             ):
                 return
         except BaseException as e:
@@ -318,6 +323,7 @@ def _run_server_attempt(
     access_log: bool,
     log_level: str,
     ws: str,
+    h11_max_incomplete_event_size: int,
 ) -> bool:
     startup_monitor.start_watchdog()
     try:
@@ -331,6 +337,15 @@ def _run_server_attempt(
                 log_level=log_level,
                 access_log=access_log,
                 ws=ws,
+                # Prefer h11 for maximum request parser compatibility across
+                # browsers, local proxies, and reverse tunnels.
+                http="h11",
+                proxy_headers=True,
+                forwarded_allow_ips="*",
+                # Browsers can send large cookie/header blocks on LAN hosts.
+                # The default h11 limit can trigger spurious
+                # "Invalid HTTP request received" 400s.
+                h11_max_incomplete_event_size=h11_max_incomplete_event_size,
             )
 
         with startup_monitor.stage("uvicorn.server.create"):
